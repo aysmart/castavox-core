@@ -1,0 +1,49 @@
+[package]
+name = "castavox-core"
+version = "0.1.0"
+authors = ["Ayorinde G. Smart"]
+description = "The parts Castavox and Pulpitry both need: transcripts, exports, audio capture, local speech, and the embedding model."
+edition = "2021"
+publish = false
+
+# Permissive on purpose, and it has to be.
+#
+# Castavox is GPL-2.0-or-later, being a fork of OBS. Pulpitry is proprietary.
+# The same code cannot be GPL in one and closed in the other: a GPL crate would
+# make Pulpitry GPL the moment it linked. MIT satisfies both -- the GPL can
+# absorb it, and a closed product can use it -- which is what makes one shared
+# copy legal rather than merely convenient.
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+parking_lot = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Transcript history and the verse library share a database file.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Summaries leave as something a church can send on.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+printpdf = { version = "0.7", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["simd", "html"] }
+
+# Microphone capture. The Azure SDK's own mic input is written against browser
+# APIs that do not exist under Node, so capture happens here.
+cpal = "0.18"
+
+# Paraphrase matching, and the model behind it.
+candle-core = "0.11"
+candle-nn = "0.11"
+candle-transformers = "0.11"
+tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+rayon = "1"
+
+# Local transcription, and fetching the models it runs on.
+whisper-rs = { version = "0.16", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "blocking"] }
+
+[profile.release]
+opt-level = "s"
