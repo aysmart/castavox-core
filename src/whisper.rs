@@ -252,12 +252,43 @@ enum Job {
     Partial(Vec<f32>),
 }
 
+/// The language whisper should be told to decode, from what the operator chose.
+///
+/// Settings hold a locale in Azure's spelling — `en-NG`, `fr-FR`, `yo-NG` —
+/// because that is what the streaming engines want. whisper.cpp wants the bare
+/// code, and rejects anything it does not know, so this takes the part before
+/// the region and checks it against whisper's own list rather than trusting it.
+///
+/// An `.en` model is asked for English whatever the setting says. Those builds
+/// cannot do anything else, and telling one to decode Yoruba does not produce
+/// Yoruba — it produces English-shaped nonsense, which is worse than a setting
+/// that was quietly ignored.
+pub fn decode_language(locale: &str, english_only: bool) -> &'static str {
+    if english_only {
+        return "en";
+    }
+
+    let base = locale.split(['-', '_']).next().unwrap_or("").to_lowercase();
+    match whisper_rs::get_lang_id(&base) {
+        // Borrowed back from whisper's own table, so the string outlives the
+        // lowercased copy made above.
+        Some(id) => whisper_rs::get_lang_str(id).unwrap_or("en"),
+        // Unset, or a locale this build of whisper has never heard of. English
+        // is what this did before there was a setting at all, and it is a
+        // better answer than refusing to transcribe.
+        None => "en",
+    }
+}
+
 pub struct Local {
     data_dir: PathBuf,
     threads: i32,
     /// What the operator has asked for. Compared against `loaded` at each safe
     /// point; a plain string compare, so polling it costs nothing.
     wanted: Mutex<String>,
+    /// The spoken language, in Azure's spelling. Read at each utterance, so
+    /// changing it in settings takes effect without restarting a session.
+    language: Mutex<String>,
     loaded: Mutex<Option<Loaded>>,
 }
 
@@ -273,6 +304,7 @@ impl Local {
             data_dir,
             threads,
             wanted: Mutex::new(model_file),
+            language: Mutex::new("en-US".to_string()),
             loaded: Mutex::new(None),
         }
     }
@@ -280,6 +312,11 @@ impl Local {
     /// Asks for a different model. Takes effect at the next utterance boundary.
     pub fn request(&self, model_file: &str) {
         *self.wanted.lock() = model_file.to_string();
+    }
+
+    /// Sets the spoken language, in Azure's spelling. Also at the next boundary.
+    pub fn set_language(&self, locale: &str) {
+        *self.language.lock() = locale.to_string();
     }
 
     pub fn loaded_model(&self) -> Option<String> {
@@ -346,8 +383,14 @@ impl Local {
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(self.threads);
+        // Transcribe, never translate: a church that selects Yoruba wants
+        // Yoruba on the screen, not an English rendering of it.
         params.set_translate(false);
-        params.set_language(Some("en"));
+        params.set_language(Some(decode_language(
+            &self.language.lock(),
+            // Derived from the file name, the same way the catalogue does it.
+            loaded.file.contains(".en"),
+        )));
         // All of this prints to stdout, which is the NDJSON pipe the host reads.
         // Left on, whisper.cpp's progress chatter would corrupt every message.
         params.set_print_special(false);
@@ -615,6 +658,37 @@ mod tests {
     /// The operator is in a settings dialog during a service. Whatever they
     /// pick -- something not downloaded, something corrupt, a name that means
     /// nothing -- the words on screen have to keep arriving.
+    #[test]
+    fn language_is_the_bare_code_whisper_knows() {
+        // Settings hold Azure's spelling; whisper wants the part before the
+        // region and nothing else.
+        assert_eq!(decode_language("en-US", false), "en");
+        assert_eq!(decode_language("en-NG", false), "en");
+        assert_eq!(decode_language("fr-FR", false), "fr");
+        assert_eq!(decode_language("yo-NG", false), "yo");
+        assert_eq!(decode_language("zh-CN", false), "zh");
+        // Underscores too, since a locale reaches us from more than one place.
+        assert_eq!(decode_language("pt_BR", false), "pt");
+    }
+
+    #[test]
+    fn an_english_only_model_is_never_asked_for_anything_else() {
+        // Those builds cannot do it. Told to decode Yoruba, one produces
+        // English-shaped nonsense rather than Yoruba, which is worse than a
+        // setting quietly ignored.
+        assert_eq!(decode_language("yo-NG", true), "en");
+        assert_eq!(decode_language("fr-FR", true), "en");
+    }
+
+    #[test]
+    fn an_unknown_locale_falls_back_rather_than_failing() {
+        // whisper rejects a code it does not know, and refusing to transcribe
+        // is a worse answer than transcribing in the language this always used.
+        assert_eq!(decode_language("", false), "en");
+        assert_eq!(decode_language("qq-ZZ", false), "en");
+        assert_eq!(decode_language("klingon", false), "en");
+    }
+
     #[test]
     #[ignore = "needs a model on disk"]
     fn a_bad_model_choice_keeps_the_good_one() {
