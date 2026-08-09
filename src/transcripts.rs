@@ -84,6 +84,25 @@ pub struct Session {
     pub word_count: i64,
 }
 
+impl Session {
+    /// A placeholder carrying nothing but an id.
+    ///
+    /// For the reply to a summary that failed: the host has to be told which
+    /// service stopped, and inventing a title or a word count to fill the shape
+    /// would put numbers on screen that were never true.
+    pub fn empty(id: i64) -> Self {
+        Self {
+            id,
+            started_at: 0,
+            ended_at: None,
+            title: String::new(),
+            summary: String::new(),
+            topics: Vec::new(),
+            word_count: 0,
+        }
+    }
+}
+
 /// One settled utterance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]

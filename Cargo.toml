@@ -21,8 +21,14 @@ parking_lot = "0.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Transcript history and the verse library share a database file.
-rusqlite = { version = "0.37", features = ["bundled"] }
+# bundled: compiles SQLite in, so there is no dependency on whatever version the
+# host ships. FTS5 is enabled in that build.
+#
+# The version has to match in every crate that reaches the database.
+# libsqlite3-sys declares `links = "sqlite3"`, so Cargo permits exactly one in
+# the tree -- two would not be a duplicate but a hard build failure, which is
+# how the two products having drifted apart on this was finally noticed.
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # Summaries leave as something a church can send on.
 zip = { version = "2", default-features = false, features = ["deflate"] }
