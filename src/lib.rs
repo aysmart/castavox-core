@@ -18,6 +18,7 @@
 //! exactly the places the two products genuinely differ. Modules that would
 //! need such an opinion take it as a parameter -- see [`log`] for the pattern.
 
+pub mod assistant;
 pub mod audio;
 pub mod embed;
 pub mod exports;
