@@ -21,6 +21,7 @@
 pub mod audio;
 pub mod embed;
 pub mod exports;
+pub mod hosted;
 pub mod log;
 pub mod node;
 pub mod tls;
