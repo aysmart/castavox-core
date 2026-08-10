@@ -95,8 +95,35 @@ let heartbeatTimer = null;
 let streamedBytes = 0;
 let reportedSeconds = 0;
 
+/** True while stdout has not drained, so interims can be dropped rather than queued. */
+let backedUp = false;
+
+/**
+ * Writes one protocol message.
+ *
+ * Interims are dropped while stdout is backed up; nothing else ever is.
+ *
+ * This is not tidiness, it is the metering. A host that reads stdout slowly --
+ * and one of ours documents that it does -- lets the buffer fill, and then
+ * `write` blocks, and a blocked write stalls Node's event loop. Every timer
+ * stops with it, including the heartbeat that reports what a church has used.
+ * The audio keeps streaming and Azure keeps charging us, and nothing is
+ * counted: the failure is silent and costs money in the one direction we
+ * cannot notice.
+ *
+ * Interims are the only messages produced fast enough to cause it and the only
+ * ones worth nothing once superseded, so they are what gives way.
+ */
 function emit(message) {
-  process.stdout.write(`${JSON.stringify(message)}\n`);
+  if (backedUp && message.type === "recognizing") return;
+
+  const room = process.stdout.write(`${JSON.stringify(message)}\n`);
+  if (room || backedUp) return;
+
+  backedUp = true;
+  process.stdout.once("drain", () => {
+    backedUp = false;
+  });
 }
 
 function fail(message, fatal) {
