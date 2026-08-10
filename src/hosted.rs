@@ -280,6 +280,43 @@ impl Broker {
 
         read(response)
     }
+
+    /// Closes a session the bridge did not close itself.
+    ///
+    /// # Why this exists twice over
+    ///
+    /// The bridge opens the session, meters it, and closes it on the way out,
+    /// because its lifetime *is* the session. That holds right up until it is
+    /// killed, and a process that has been killed closes nothing. Two sessions
+    /// once survived their runs that way, filled a concurrency limit of two,
+    /// and refused the next service until they were cleared by hand.
+    ///
+    /// So the parent closes it as well, once the child is gone. The route is
+    /// idempotent — a session already closed answers success — so the two
+    /// racing costs nothing and the ordinary path still reports the seconds.
+    ///
+    /// # And why the seconds are the caller's to state
+    ///
+    /// Only the bridge knows how much audio it streamed against what it has
+    /// already reported. A parent closing up after it knows neither, and
+    /// passing `0` is the honest answer: the tail of an interrupted session is
+    /// lost. Inventing a number for it would bill a church for a guess.
+    pub fn end_session(&self, device_token: &str, session_id: &str, seconds: i64) -> Result<()> {
+        let response = self
+            .client()?
+            .post(format!("{}/api/v1/session/end", self.base))
+            .bearer_auth(device_token)
+            .json(&serde_json::json!({
+                "sessionId": session_id,
+                "seconds": seconds.max(0),
+            }))
+            .send()
+            .map_err(|error| Error::Unreachable(error.to_string()))?;
+
+        // The body says how much the session ran to in the end, which is the
+        // broker's business rather than ours; that it closed is all this needs.
+        read::<serde_json::Value>(response).map(|_| ())
+    }
 }
 
 impl Default for Broker {
@@ -476,6 +513,22 @@ mod tests {
         let request = requests.recv().expect("the request");
         assert!(request.contains("GET /api/v1/entitlement"));
         assert!(request.to_lowercase().contains("authorization: bearer dev-token-abc"));
+    }
+
+    #[test]
+    fn closing_a_session_names_it_and_claims_no_seconds() {
+        let (base, requests) = serve(200, r#"{"ended":true,"secondsThisSession":312}"#);
+
+        Broker::at(&base)
+            .end_session("dev-token-abc", "sess_9", 0)
+            .expect("the close");
+
+        let request = requests.recv().expect("the request");
+        assert!(request.contains("POST /api/v1/session/end"));
+        assert!(request.to_lowercase().contains("authorization: bearer dev-token-abc"));
+        assert!(request.contains(r#""sessionId":"sess_9""#));
+        // Nothing invented for the stretch nobody measured.
+        assert!(request.contains(r#""seconds":0"#));
     }
 
     #[test]

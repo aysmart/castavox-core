@@ -68,12 +68,23 @@ module.exports = {
 };
 `;
 
+/**
+ * The same stub, but one that never acknowledges a stop.
+ *
+ * What a dead connection does. Derived from the stub above rather than written
+ * out again, so the two cannot drift into testing different bridges.
+ */
+const STUB_SDK_STOP_HANGS = STUB_SDK.replace(
+  "stopContinuousRecognitionAsync(done) { setTimeout(() => done(), 5); }",
+  "stopContinuousRecognitionAsync() { say('STOP:ignored'); }",
+);
+
 /** The bridge, beside a fake node_modules so it resolves the stub. */
-function stage() {
+function stage(sdk = STUB_SDK) {
   const dir = mkdtempSync(resolve(tmpdir(), "bridge-test-"));
   const module = resolve(dir, "node_modules/microsoft-cognitiveservices-speech-sdk");
   mkdirSync(module, { recursive: true });
-  writeFileSync(resolve(module, "index.js"), STUB_SDK);
+  writeFileSync(resolve(module, "index.js"), sdk);
   writeFileSync(resolve(module, "package.json"), '{"name":"microsoft-cognitiveservices-speech-sdk","main":"index.js"}');
   copyFileSync(resolve(here, "index.js"), resolve(dir, "index.js"));
   return dir;
@@ -173,6 +184,11 @@ describe("a hosted session", () => {
     strictEqual(calls[0].path, "session/start");
     strictEqual(calls[0].authorization, "Bearer device-token-secret");
 
+    // The parent is told which session this is, so that it can close it if we
+    // are killed before we can. It is the first thing on stdout.
+    strictEqual(run.events[0].type, "session");
+    strictEqual(run.events[0].id, "sess-1");
+
     // Three seconds of audio.
     run.child.stdin.write(Buffer.alloc(BYTES_PER_SECOND * 3));
     await until(() => calls.some((c) => c.path === "session/heartbeat"), "the first heartbeat");
@@ -210,6 +226,49 @@ describe("a hosted session", () => {
       .filter((c) => c.path === "session/heartbeat" || c.path === "session/end")
       .reduce((total, c) => total + c.payload.seconds, 0);
     strictEqual(billed, 6);
+  });
+
+  it("closes the session even when the recogniser never acknowledges the stop", async () => {
+    /*
+     * The bug this exists to keep fixed.
+     *
+     * Closing used to happen inside the stop callback, so a stop that never
+     * came took the close with it, and the failsafe killed the process with
+     * the session still open on the broker. It counted against the
+     * concurrency limit until somebody cleared it by hand -- twice.
+     *
+     * A connection that has just failed is exactly when a stop goes
+     * unacknowledged, and exactly when a session most wants closing.
+     */
+    const { server, calls } = broker({
+      "session/start": () => ({
+        status: 200,
+        body: { sessionId: "sess-hangs", token: "azure-first", region: "uksouth", heartbeatSeconds: 60 },
+      }),
+      "session/end": () => ({ status: 200, body: { ended: true } }),
+    });
+    servers.push(server);
+    const url = await listen(server);
+    const run = start(stage(STUB_SDK_STOP_HANGS), url);
+
+    // The stub never fires sessionStarted, so "listening" never arrives; what
+    // says the recogniser is up is that it was built at all.
+    await until(() => run.stderr().includes("BUILT:"), "the recogniser");
+
+    run.child.stdin.write(Buffer.alloc(BYTES_PER_SECOND * 2));
+    await settle(50);
+    run.child.kill("SIGTERM");
+
+    // It still leaves, on the failsafe rather than on a clean stop.
+    strictEqual(await run.exited, 0);
+    ok(run.stderr().includes("STOP:ignored"), "the stop was asked for and ignored");
+
+    const end = calls.find((c) => c.path === "session/end");
+    ok(end, "the session was closed despite the stop never answering");
+    strictEqual(end.payload.sessionId, "sess-hangs");
+    // And the tail was still reported: nothing about a hung stop makes the
+    // seconds unknown, because stdin had already ended.
+    strictEqual(end.payload.seconds, 2);
   });
 
   it("refuses to listen when the subscription refuses, and says why", async () => {

@@ -26,6 +26,7 @@
  * stdout carries protocol messages only. Everything else goes to stderr.
  *
  * Messages emitted:
+ *   {"type":"session","id":"..."}            hosted only, before anything else
  *   {"type":"listening"}
  *   {"type":"recognizing","text":"..."}
  *   {"type":"recognized","text":"...","offsetMs":n,"durationMs":n}
@@ -44,6 +45,11 @@
  * heartbeat, and closes it on the way out. Splitting that across two processes
  * would mean inventing a control channel down a pipe already carrying PCM, and
  * would leave sessions open whenever the two disagreed about what was running.
+ *
+ * The session id is announced on stdout all the same, because a process that
+ * is killed cannot close anything and this one can be: the parent uses it to
+ * close the session as a backstop once we are gone. Closing twice is safe --
+ * the broker treats the second as already done.
  *
  * Our own Azure key is never here. What arrives is short-lived, scoped and
  * revocable, and the device token that fetches it is never written to stdout.
@@ -206,6 +212,11 @@ async function openSession() {
     fail("Your Castavox subscription did not return a usable credential.", true);
     return false;
   }
+
+  // Told to the parent before any audio moves, so that however this process
+  // ends -- including killed, where nothing here gets to run -- there is
+  // something left that knows which session to close.
+  emit({ type: "session", id: session.id });
   return true;
 }
 
@@ -365,38 +376,53 @@ function describe(err) {
   return err.message || String(err);
 }
 
+/**
+ * Ends the run: stops listening, closes the session, and quits.
+ *
+ * # The two are started together, not one after the other
+ *
+ * There is nothing the close needs from the recogniser. stdin has already
+ * ended by the time this runs, so no more audio can arrive and `unreported()`
+ * will not change again -- what there is to report is final at the first line
+ * of this function.
+ *
+ * It used to wait: stop Azure, and report on the way out of that callback.
+ * Both then had to fit inside the one grace window below, and stopping a
+ * recogniser is a round trip to Azure over a connection that is often the very
+ * thing that has just failed. When it was slow the failsafe killed the process
+ * with `session/end` still in flight; when the callback never came at all --
+ * which is what a dead connection does -- the close was never even started.
+ * Either way the session stayed open on the broker, counted against the
+ * concurrency limit, and had to be cleared by hand.
+ */
 function shutdown(code) {
   if (shuttingDown) return;
   shuttingDown = true;
   clearTimeout(restartTimer);
   clearTimeout(heartbeatTimer);
 
-  let leaving = false;
-  const finish = () => {
-    if (leaving) return;
-    leaving = true;
-    // The last seconds are worth reporting and worth no delay beyond the
-    // failsafe below, which fires whether or not this ever answers.
-    closeSession().finally(() => process.exit(code || 0));
-  };
+  const closed = closeSession();
 
-  if (!recognizer) return finish();
-
-  try {
-    recognizer.stopContinuousRecognitionAsync(
-      () => {
+  const stopped = new Promise((done) => {
+    if (!recognizer) return done();
+    try {
+      recognizer.stopContinuousRecognitionAsync(() => {
         try {
           recognizer.close();
         } catch {
           /* ignore */
         }
-        finish();
-      },
-      finish,
-    );
-  } catch {
-    finish();
-  }
+        done();
+      }, done);
+    } catch {
+      done();
+    }
+  });
+
+  // Settled, not successful: a close the broker refused has been reported as
+  // well as it can be from here, and the parent closes it again regardless.
+  Promise.allSettled([closed, stopped]).then(() => process.exit(code || 0));
+
   // Never hang the parent waiting on a clean close.
   setTimeout(() => process.exit(code || 0), SHUTDOWN_GRACE_MS).unref();
 }
