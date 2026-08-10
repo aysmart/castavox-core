@@ -36,7 +36,21 @@ const DEFAULT_TARGETS = [
   "../Castavox/sidecar/speech-node/src",
 ];
 
-export const hashOf = (text) => createHash("sha256").update(text, "utf8").digest("hex");
+/**
+ * The hash of the bridge's *content*, not of its bytes on disk.
+ *
+ * Line endings are normalised first, and that is load-bearing rather than
+ * tidy. Git for Windows converts LF to CRLF on checkout, so the same commit
+ * produces a different file on a Windows runner than on a Linux one — and a
+ * check that hashed the raw bytes failed every Windows build while passing
+ * macOS and Linux, which reads as the bridge having been tampered with when
+ * nothing had been touched at all.
+ *
+ * What this is for is catching a copy edited in place instead of in
+ * castavox-core. A newline convention is not that.
+ */
+export const hashOf = (text) =>
+  createHash("sha256").update(text.replace(/\r\n/g, "\n"), "utf8").digest("hex");
 
 /** The revision being copied, so a stale product copy can be identified later. */
 function revision() {
