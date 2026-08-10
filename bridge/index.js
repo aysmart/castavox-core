@@ -121,6 +121,22 @@ async function broker(path, payload) {
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
+    // A redirect that changed host has already cost us the Authorization
+    // header -- fetch drops it by spec, and rightly so. What comes back is a
+    // 401 blaming the licence, which is the one thing that is not wrong.
+    if (response.redirected && new URL(response.url).host !== new URL(BROKER).host) {
+      return {
+        reached: true,
+        ok: false,
+        status: 0,
+        detail: {
+          message:
+            "Castavox is configured with the wrong address: it redirects, and a " +
+            "credential is not carried across a redirect. Update the app.",
+        },
+      };
+    }
+
     const detail = await response.json().catch(() => ({}));
     return { reached: true, ok: response.ok, status: response.status, detail };
   } catch {

@@ -23,7 +23,18 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 /// Where the broker lives, unless a build or a test says otherwise.
-const DEFAULT_BASE: &str = "https://castavox.com";
+///
+/// The `www` is not cosmetic and must not be tidied away. The apex redirects
+/// there, and a redirect that changes host makes both of our clients drop the
+/// `Authorization` header — reqwest and the browser fetch spec agree on that,
+/// and they are right to: a redirect is somewhere else, and credentials should
+/// not follow a request there.
+///
+/// The symptom is unusually cruel. Activation carries no credential, so it
+/// works, the token is stored, and the machine looks activated — then every
+/// authenticated call afterwards comes back 401 saying it is not, which reads
+/// as a licence problem and is not one.
+const DEFAULT_BASE: &str = "https://www.castavox.com";
 
 /// Long enough for a slow connection, short enough that a settings dialog is
 /// not simply stuck.
@@ -224,6 +235,10 @@ impl Broker {
         crate::tls::install();
         reqwest::blocking::Client::builder()
             .timeout(TIMEOUT)
+            // Not followed, on purpose. Following one across hosts silently
+            // drops the credential and returns a 401 that blames the licence;
+            // refusing turns that into a message naming the real cause.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|error| Error::Unexpected(error.to_string()))
     }
@@ -276,12 +291,29 @@ impl Default for Broker {
 /// Turns a response into either the thing asked for or a refusal worth showing.
 fn read<T: serde::de::DeserializeOwned>(response: reqwest::blocking::Response) -> Result<T> {
     let status = response.status();
+    let location = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     let body = response
         .text()
         .map_err(|error| Error::Unreachable(error.to_string()))?;
 
     if status.is_success() {
         return serde_json::from_str(&body).map_err(|error| Error::Unexpected(error.to_string()));
+    }
+
+    // A redirect is a misconfigured base URL, and saying so beats every other
+    // answer available: the request never reached a route, so there is no
+    // refusal to report, and the 401 it would otherwise become points the
+    // operator at a licence that is perfectly good.
+    if status.is_redirection() {
+        return Err(Error::Unexpected(format!(
+            "the broker redirected to {}; CASTAVOX_BROKER_URL must name the canonical host, \
+             because a credential is not carried across one",
+            location.unwrap_or_else(|| "somewhere else".to_string()),
+        )));
     }
 
     // The broker words its refusals for the person at the desk. Anything else
@@ -366,8 +398,13 @@ mod tests {
             let _ = sender.send(request);
 
             let reason = if status < 300 { "OK" } else { "NO" };
+            let location = if (300..400).contains(&status) {
+                "location: https://www.elsewhere.test/api/v1/entitlement\r\n"
+            } else {
+                ""
+            };
             let response = format!(
-                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n{location}content-length: {}\r\nconnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = reader.get_mut().write_all(response.as_bytes());
@@ -479,6 +516,24 @@ mod tests {
         assert_eq!(state.remaining.speech_seconds, 10);
         assert_eq!(state.usage.total, 5);
         assert!(state.usage.by_app.is_empty());
+    }
+
+    #[test]
+    fn a_redirect_is_reported_as_a_redirect_and_not_as_a_bad_licence() {
+        // The bug this exists for: the apex host redirects to www, both clients
+        // drop the credential across it by spec, and the 401 that comes back
+        // blames a licence that is perfectly good. Activation carries no
+        // credential, so it succeeds first and the machine looks activated.
+        let (base, _requests) = serve(308, "");
+
+        let error = Broker::at(&base)
+            .entitlement("dev-token-abc")
+            .expect_err("a redirect");
+
+        assert_eq!(error.reason(), "unexpected");
+        let Error::Unexpected(detail) = &error else { panic!("wrong kind: {error:?}") };
+        assert!(detail.contains("redirected"), "should name the cause: {detail}");
+        assert!(detail.contains("elsewhere.test"), "should name where: {detail}");
     }
 
     #[test]
