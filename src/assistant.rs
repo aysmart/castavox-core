@@ -18,11 +18,54 @@
 //! Our key is never in either product. On a subscription the app carries a
 //! device token, and the model credentials stay on the server.
 
-use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// Azure AI Foundry's inference API is versioned by query string.
 pub const DEFAULT_API_VERSION: &str = "2024-05-01-preview";
+
+/// Why a completion did not come back.
+///
+/// Typed rather than a message, because the caller has to word the advice and
+/// the advice depends on the status. A 404 from Foundry almost never means the
+/// deployment is missing — it means the API version predates the `/models`
+/// route — and telling somebody their deployment is gone sends them to rebuild
+/// something that is fine. Only the caller knows whether the operator has a key
+/// to check or is on a subscription and has nothing to check at all.
+///
+/// The payload is carried rather than summarised. It goes to the log, never to
+/// the screen: what comes back can be a page of somebody else's HTML, and
+/// putting that in front of an operator buries the one sentence that would have
+/// helped.
+#[derive(Debug)]
+pub enum Failure {
+    /// Network, TLS, a timeout. Nothing a different body would fix.
+    Unreachable(String),
+    /// It answered, and said no.
+    Refused {
+        status: reqwest::StatusCode,
+        payload: String,
+    },
+    /// It answered with something that was not a completion.
+    Unexpected(String),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Unreachable(detail) => write!(formatter, "could not reach the model: {detail}"),
+            Failure::Refused { status, payload } => write!(
+                formatter,
+                "the model returned {status}: {}",
+                payload.chars().take(300).collect::<String>()
+            ),
+            Failure::Unexpected(detail) => write!(formatter, "{detail}"),
+        }
+    }
+}
+
+impl std::error::Error for Failure {}
+
+pub type Result<T> = std::result::Result<T, Failure>;
 
 /// A church's own deployment.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -117,9 +160,20 @@ pub fn endpoint_url(endpoint: &str, api_version: &str) -> String {
 /// outright. Neither is wrong, and an operator cannot be expected to know which
 /// family their deployment belongs to, so the strict request is tried and this
 /// decides whether the refusal is worth retrying without it.
+///
+/// Matched on the message because there is no code for it: the families that
+/// cannot do this disagree about the status, the error type and the wording,
+/// and all that is reliably shared is that they name the thing they are
+/// complaining about. A false positive costs one retry, which generates no
+/// tokens; a false negative costs the operator their summary, so this errs
+/// towards retrying.
+///
+/// All three spellings, because both summarisers carried this list and this
+/// only carried the first — so a deployment that said "json_object" got the
+/// retry in one product and a failed summary in the other.
 pub fn is_response_format_refusal(payload: &str) -> bool {
     let lower = payload.to_lowercase();
-    lower.contains("response_format")
+    lower.contains("response_format") || lower.contains("json_object") || lower.contains("json mode")
 }
 
 /// Sends a chat completion and returns the message content.
@@ -143,14 +197,18 @@ pub fn complete(
 
     match send(client, route, &body) {
         Ok(payload) => content_of(&payload),
-        Err(error) if strict_json && is_response_format_refusal(&error.to_string()) => {
+        // Matched on the payload rather than on a rendered message. The
+        // rendered one truncates at 300 characters, so a deployment that named
+        // the parameter later than that in its complaint never got the retry --
+        // it simply failed, and looked like a deployment that was down.
+        Err(Failure::Refused { payload, .. }) if strict_json && is_response_format_refusal(&payload) => {
             // The deployment does not take the parameter. Ask again without it
             // and read the answer more forgivingly; that is the caller's job.
             let mut plain = body;
             plain.as_object_mut().map(|map| map.remove("response_format"));
             content_of(&send(client, route, &plain)?)
         }
-        Err(error) => Err(error),
+        Err(failure) => Err(failure),
     }
 }
 
@@ -177,7 +235,7 @@ fn send(
         .header("content-type", "application/json")
         .json(body)
         .send()
-        .context("could not reach the model")?;
+        .map_err(|error| Failure::Unreachable(error.to_string()))?;
 
     let status = response.status();
     let payload = response.text().unwrap_or_default();
@@ -185,18 +243,21 @@ fn send(
     if status.is_redirection() {
         // The same trap as the broker: a redirect that changes host drops the
         // credential, and what comes back blames the caller for it.
-        bail!("the model endpoint redirected; it must name the canonical host");
+        return Err(Failure::Unexpected(
+            "the model endpoint redirected; it must name the canonical host".to_string(),
+        ));
     }
     if !status.is_success() {
-        bail!("the model returned {status}: {}", payload.chars().take(300).collect::<String>());
+        return Err(Failure::Refused { status, payload });
     }
     Ok(payload)
 }
 
 /// Digs the message content out of a chat completion.
 fn content_of(payload: &str) -> Result<String> {
-    let parsed: serde_json::Value =
-        serde_json::from_str(payload).context("the model response was not JSON")?;
+    let parsed: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
+        Failure::Unexpected(format!("the model response was not JSON: {error}"))
+    })?;
 
     Ok(parsed
         .get("choices")
@@ -211,6 +272,51 @@ fn content_of(payload: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_about_json_mode_is_told_from_a_real_failure() {
+        // The families that cannot do this each phrase it differently, and the
+        // point of matching loosely is that a new one should still be caught.
+        assert!(is_response_format_refusal(
+            r#"{"error":{"message":"Extra inputs are not permitted: response_format"}}"#
+        ));
+        assert!(is_response_format_refusal(
+            r#"{"error":{"message":"'json_object' is not supported by this model"}}"#
+        ));
+        assert!(is_response_format_refusal(
+            r#"{"error":{"message":"JSON mode is unavailable"}}"#
+        ));
+
+        // These must not trigger a retry: the second attempt would fail the
+        // same way and the operator would wait twice as long to be told.
+        assert!(!is_response_format_refusal(
+            r#"{"error":{"code":"401","message":"Access denied"}}"#
+        ));
+        assert!(!is_response_format_refusal(
+            r#"{"error":{"code":"404","message":"Resource not found"}}"#
+        ));
+        assert!(!is_response_format_refusal(
+            r#"{"error":{"message":"Rate limit exceeded"}}"#
+        ));
+    }
+
+    #[test]
+    fn a_refusal_names_its_status_so_the_caller_can_word_the_advice() {
+        // The reason Failure is typed rather than a string. A 404 from Foundry
+        // almost never means the deployment is missing, and only the caller
+        // knows whether the operator has a key to check or is on a
+        // subscription and has nothing to check at all.
+        let failure = Failure::Refused {
+            status: reqwest::StatusCode::NOT_FOUND,
+            payload: "<html>Resource not found</html>".to_string(),
+        };
+        let Failure::Refused { status, .. } = &failure else { panic!("wrong kind") };
+        assert_eq!(status.as_u16(), 404);
+
+        // And the payload is carried whole, for the log, rather than being
+        // summarised into the message an operator would see.
+        assert!(failure.to_string().contains("404"));
+    }
 
     #[test]
     fn a_foundry_resource_root_gains_the_models_segment() {
