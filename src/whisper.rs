@@ -21,15 +21,25 @@
 //!
 //! # The model
 //!
-//! Not bundled and not chosen for the operator. whisper.cpp publishes about
-//! thirty, from a 30 MB quantised tiny that will run on a decade-old laptop to
-//! a 1.5 GB large that will not -- and only the person at that machine knows
-//! which they can afford, in disk, in CPU and in patience.
+//! Not bundled. whisper.cpp publishes about thirty, from a 30 MB quantised tiny
+//! that will run on a decade-old laptop to a 1.5 GB large that will not, so the
+//! list is fetched from whisper.cpp's own repository with real sizes. Nothing
+//! about which models exist is written into this app, because that is a fact
+//! about somebody else's repository and it changes without telling us.
 //!
-//! So the list is fetched from whisper.cpp's own repository, with real sizes,
-//! and the operator picks. Nothing about which models exist is written into
-//! this app, because that is a fact about somebody else's repository and it
-//! changes without telling us.
+//! It *is* now chosen for the operator, which it was not. The argument for
+//! asking was that only the person at that machine knows what they can afford
+//! in disk, in CPU and in patience — which is true, and which they still cannot
+//! answer, because nothing in the question tells them whether base or small is
+//! the one their laptop keeps up with. So the question went unanswered, the
+//! engine sat unusable behind it, and the operator concluded local
+//! transcription did not work.
+//!
+//! `recommended` now picks one from the machine's core count, and the operator
+//! overrides it whenever they like. The guess is deliberately conservative and
+//! the reason is asymmetric: too small costs some accuracy on names, which is
+//! quiet and correctable, while too large costs a transcript that arrives after
+//! the sentence, which a congregation sees.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -154,6 +164,72 @@ fn installed_files(data_dir: &Path) -> Vec<String> {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|name| name.starts_with("ggml-") && name.ends_with(".bin"))
         .collect()
+}
+
+/// The sizes that are ever chosen for somebody, smallest first.
+///
+/// whisper.cpp publishes far more than this — quantised builds, `large-v3`,
+/// `large-v3-turbo` — and all of them remain selectable by hand. These four are
+/// the ones whose behaviour on ordinary church hardware is predictable enough to
+/// pick unattended; `medium` is here only so a machine that is running it can be
+/// stepped down from, never as an automatic choice.
+const LADDER: [&str; 4] = ["tiny", "base", "small", "medium"];
+
+/// The model to start with on this machine, when nobody has chosen one.
+///
+/// Sized from the logical core count, because with no GPU backend compiled in
+/// this decodes on the CPU everywhere and throughput is what decides whether a
+/// verse arrives during the sentence or after it.
+///
+/// The bands are deliberately cautious. Guessing too small costs accuracy on
+/// names and places — real, but quiet, and the operator can raise it once they
+/// have seen it work. Guessing too large costs a transcript running minutes
+/// behind a preacher, which the whole congregation sees and which reads as the
+/// software being broken. Those two are not worth trading evenly, so the bands
+/// sit a size below what a benchmark alone would suggest — this machine is also
+/// encoding video or driving a projector while it decodes.
+///
+/// `small` is the ceiling. `medium` is 1.5 GB to fetch and beyond most of the
+/// laptops this exists for, and a download that large should be somebody's
+/// decision rather than a consequence of pressing Start.
+pub fn recommended(locale: &str) -> String {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let size = match cores {
+        0..=3 => "tiny",
+        4..=9 => "base",
+        _ => "small",
+    };
+    named(size, english(locale))
+}
+
+/// The next size down from what is loaded, for a machine that cannot keep up.
+///
+/// Returns none at the bottom of the ladder, or for a model that is not on it —
+/// somebody running `large-v3-turbo` chose it deliberately and does not need us
+/// guessing at what they meant.
+pub fn smaller_than(file: &str) -> Option<String> {
+    let label = file.trim_start_matches("ggml-").trim_end_matches(".bin");
+    let size = label.split('.').next().unwrap_or_default();
+    let index = LADDER.iter().position(|rung| *rung == size)?;
+    Some(named(LADDER[index.checked_sub(1)?], label.contains(".en")))
+}
+
+/// Whether the `.en` builds are the right family for this locale. They are
+/// better at English and cannot do anything else.
+fn english(locale: &str) -> bool {
+    let base = locale.split(['-', '_']).next().unwrap_or_default();
+    base.eq_ignore_ascii_case("en") || base.is_empty()
+}
+
+fn named(size: &str, english: bool) -> String {
+    // large has no .en build, so this would name a file that does not exist --
+    // but nothing above ever asks for one, and a caller that did should get
+    // something fetchable rather than a 404 an hour into a service.
+    if english && size != "large" {
+        format!("ggml-{size}.en.bin")
+    } else {
+        format!("ggml-{size}.bin")
+    }
 }
 
 /// Where a model lives once fetched.
@@ -507,10 +583,19 @@ impl Local {
                  */
                 if waiting >= BEHIND_AFTER && !warned {
                     warned = true;
+                    // Named, not merely implied. "Choose a smaller one" leaves
+                    // the same question the operator could not answer when they
+                    // installed it; the next rung down is an instruction they
+                    // can follow between services without knowing what any of
+                    // these models are.
+                    let advice = self
+                        .loaded_model()
+                        .and_then(|file| smaller_than(&file))
+                        .map(|smaller| format!("{smaller} under Settings will keep up."))
+                        .unwrap_or_else(|| "A smaller model under Settings will keep up.".into());
                     note(format!(
                         "Transcription is running behind: {waiting} utterances are still \
-                         being decoded. This model is too large for this machine -- a \
-                         smaller one under Settings will keep up."
+                         being decoded. This model is too large for this machine -- {advice}"
                     ));
                 }
                 silence = Duration::ZERO;
@@ -687,6 +772,44 @@ mod tests {
         assert_eq!(decode_language("", false), "en");
         assert_eq!(decode_language("qq-ZZ", false), "en");
         assert_eq!(decode_language("klingon", false), "en");
+    }
+
+    #[test]
+    fn the_recommendation_is_a_model_that_exists() {
+        // Whatever this machine has, the answer has to be a file whisper.cpp
+        // actually publishes -- it is fetched without anybody checking it.
+        let english = recommended("en-NG");
+        assert!(english.starts_with("ggml-") && english.ends_with(".en.bin"), "{english}");
+        assert!(
+            LADDER.iter().any(|size| english == format!("ggml-{size}.en.bin")),
+            "{english} is not on the ladder",
+        );
+        // Never medium: 1.5 GB is somebody's decision, not a consequence of
+        // pressing Start.
+        assert_ne!(english, "ggml-medium.en.bin");
+    }
+
+    #[test]
+    fn a_church_not_working_in_english_is_not_given_an_english_only_model() {
+        // The .en builds cannot decode anything else, so choosing one for a
+        // Yoruba service would be choosing a transcript of nonsense.
+        assert!(!recommended("yo-NG").contains(".en."));
+        assert!(!recommended("fr-FR").contains(".en."));
+        // Unset means English, which is what everything else here assumes.
+        assert!(recommended("").contains(".en."));
+    }
+
+    #[test]
+    fn falling_behind_names_the_next_size_down() {
+        assert_eq!(smaller_than("ggml-small.en.bin").as_deref(), Some("ggml-base.en.bin"));
+        assert_eq!(smaller_than("ggml-medium.bin").as_deref(), Some("ggml-small.bin"));
+        assert_eq!(smaller_than("ggml-base.en.bin").as_deref(), Some("ggml-tiny.en.bin"));
+        // Already the smallest there is: there is no advice left to give, and
+        // inventing some would send the operator looking for a file.
+        assert_eq!(smaller_than("ggml-tiny.en.bin"), None);
+        // Chosen deliberately and off the ladder. Guessing what somebody
+        // running large-v3-turbo meant is not our business.
+        assert_eq!(smaller_than("ggml-large-v3-turbo.bin"), None);
     }
 
     #[test]
