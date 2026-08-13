@@ -86,7 +86,21 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "blocking"] }
 
 [profile.release]
+# Size, except where speed is the product.
+#
+# Small binaries matter here: two desktop applications, downloaded over
+# connections that are often poor, updated regularly. But `whisper-rs` and the
+# ggml it builds are the one thing in this crate whose *speed* is what a church
+# experiences, and optimising those for size is optimising the wrong thing --
+# a transcript that arrives after the sentence is not a smaller download, it is
+# a broken feature.
 opt-level = "s"
+
+[profile.release.package.whisper-rs]
+opt-level = 3
+
+[profile.release.package.whisper-rs-sys]
+opt-level = 3
 
 # Metal on macOS, which is the difference between "needs a fast Mac" and "runs
 # on the Mac a church already has". Measured on an M-series machine with

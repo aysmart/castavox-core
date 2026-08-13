@@ -211,6 +211,63 @@ fn interim_pace(last_decode_ms: usize) -> Duration {
 /// stepped down from, never as an automatic choice.
 const LADDER: [&str; 4] = ["tiny", "base", "small", "medium"];
 
+/// How fast this machine decodes, measured rather than guessed.
+///
+/// Returns the real-time factor: seconds of processor time per second of audio.
+/// Below 1.0 means it decodes faster than speech arrives, which is the whole
+/// question. Around 0.3 is comfortable; past 0.7 a service will fall behind,
+/// because a real one is also capturing, detecting and drawing.
+///
+/// # Why this exists at all
+///
+/// Everything else in this module that judges a machine is a guess from its
+/// core count, and the guesses have been wrong in both directions -- a
+/// thin-and-light advertising sixteen threads was handed a model it could not
+/// carry, and an Apple laptop was told it might struggle when it decodes
+/// twenty-five times faster than real time. A number settles it in four
+/// seconds.
+///
+/// The audio is synthetic, and that is sound: whisper pads every window to
+/// thirty seconds internally, so the cost of a decode is set by the model and
+/// the window rather than by what was said. Silence times the same as a sermon.
+pub fn measure(data_dir: &Path, file: &str) -> Result<f32> {
+    if !is_installed(data_dir, file) {
+        return Err(anyhow!("{file} is not downloaded"));
+    }
+
+    let engine = Local::new(data_dir.to_path_buf(), file.to_string());
+    engine.ensure(&|_| {})?;
+
+    let seconds = 5.0f32;
+    let samples = vec![0.0f32; (TARGET_SAMPLE_RATE as f32 * seconds) as usize];
+
+    // The first decode loads and warms; the second is the one worth timing.
+    let _ = engine.transcribe(&samples);
+    let began = Instant::now();
+    engine.transcribe(&samples)?;
+
+    Ok(began.elapsed().as_secs_f32() / seconds)
+}
+
+/// What a measured real-time factor means for a service, in a sentence.
+pub fn describe_speed(factor: f32) -> String {
+    let times = if factor > 0.0 { 1.0 / factor } else { 0.0 };
+    if factor <= 0.35 {
+        format!("This machine transcribes about {times:.0}x faster than speech — comfortable.")
+    } else if factor <= 0.7 {
+        format!(
+            "This machine transcribes about {times:.1}x faster than speech. That is enough, but \
+             not by much: a long service may start to fall behind."
+        )
+    } else {
+        format!(
+            "This machine transcribes about {times:.1}x faster than speech, which is not enough \
+             for a live service. A smaller model may help; a subscription or an Azure key \
+             transcribes on our machines instead."
+        )
+    }
+}
+
 /// Whether this machine is likely to keep up with a preacher.
 ///
 /// # What actually decides it
@@ -241,11 +298,18 @@ pub fn likely_keeps_up() -> bool {
         return true;
     }
 
-    // Everything else is judged on core count, which is the only portable
-    // proxy available without a dependency that reads CPU model names. Twelve
-    // is the line between a laptop bought for spreadsheets and one bought for
-    // work that is heavy.
-    cores >= 12
+    /*
+     * Everything else is judged on core count, and the bar is high because the
+     * number lies about thin-and-lights.
+     *
+     * A Dell XPS advertises twelve to sixteen threads and could not keep up at
+     * all. Sixteen genuine cores is a desktop or a mobile workstation; twelve
+     * threads is an ultrabook. The line goes above the machines that report a
+     * flattering number, which means some capable laptops are told they are
+     * marginal -- a warning they can ignore, against a promise that fails
+     * during a sermon.
+     */
+    cores >= 16
 }
 
 /// The model to start with on this machine, when nobody has chosen one.
@@ -267,16 +331,37 @@ pub fn likely_keeps_up() -> bool {
 /// decision rather than a consequence of pressing Start.
 pub fn recommended(locale: &str) -> String {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    let size = match cores {
-        0..=3 => "tiny",
-        // `small` needs a genuinely large machine, and the threshold is high
-        // because this number is not comparable across architectures: it counts
-        // hardware threads, so an 8-core Intel reports 16 while an 8-core Apple
-        // silicon reports 8 and is the faster of the two at this work. Set low
-        // enough to catch the Intel, it hands 466 MB to a mid-range laptop that
-        // then has to be stepped back down.
-        4..=11 => "base",
-        _ => "small",
+
+    /*
+     * Thread count is not comparable across architectures, and an earlier
+     * version of this treated it as though it were.
+     *
+     * A Dell XPS reports twelve to sixteen hardware threads and is a
+     * thin-and-light: a handful of performance cores, the rest efficiency
+     * cores, in a chassis that throttles under sustained load. An Apple silicon
+     * laptop reports eight and is several times quicker at this. Counting
+     * threads alone handed that XPS `small` -- 466 MB of model on cores that
+     * could not carry it -- and the result was reported, accurately, as
+     * "totally useless".
+     *
+     * So the ceiling is per architecture. Apple silicon may have `small`
+     * because every machine in that family can run it. Everything else stops
+     * at `base` however many threads it advertises, because the number does not
+     * distinguish a workstation from a laptop pretending to be one, and being
+     * wrong downward costs some accuracy while being wrong upward costs the
+     * whole feature.
+     *
+     * The engine still says when it is falling behind, and that report remains
+     * the only thing here that is measured rather than guessed.
+     */
+    let apple_silicon = cfg!(all(target_arch = "aarch64", target_os = "macos"));
+
+    let size = match (apple_silicon, cores) {
+        (_, 0..=3) => "tiny",
+        (true, 4..=9) => "base",
+        (true, _) => "small",
+        // Not Apple silicon: base is the ceiling, whatever it claims to have.
+        (false, _) => "base",
     };
     named(size, english(locale))
 }
@@ -673,20 +758,54 @@ impl Local {
                  */
                 if waiting >= BEHIND_AFTER && !warned {
                     warned = true;
-                    // Named, not merely implied. "Choose a smaller one" leaves
-                    // the same question the operator could not answer when they
-                    // installed it; the next rung down is an instruction they
-                    // can follow between services without knowing what any of
-                    // these models are.
-                    let advice = self
-                        .loaded_model()
-                        .and_then(|file| smaller_than(&file))
-                        .map(|smaller| format!("{smaller} under Settings will keep up."))
-                        .unwrap_or_else(|| "A smaller model under Settings will keep up.".into());
-                    note(format!(
-                        "Transcription is running behind: {waiting} utterances are still \
-                         being decoded. This model is too large for this machine -- {advice}"
-                    ));
+
+                    /*
+                     * Step down, rather than advise a step down.
+                     *
+                     * This used to name the smaller model and leave it to the
+                     * operator. That is the right *sentence* and the wrong
+                     * moment: they are mid-service, watching a transcript fall
+                     * further behind, and the fix is in a settings dialog
+                     * behind a list of thirty files. What actually happened is
+                     * that the feature was written off as useless -- correctly,
+                     * from where they were standing.
+                     *
+                     * So it does it. Between utterances is already a safe point
+                     * to change model, and a smaller one that keeps up is
+                     * strictly better than a larger one that does not: the
+                     * accuracy lost is nothing against a transcript arriving
+                     * after the sermon.
+                     *
+                     * Only to a model already on disk. Downloading one takes
+                     * minutes over the connection this machine has, and doing
+                     * it mid-service would compete with the recogniser for the
+                     * network. If there is nothing smaller here, it says so and
+                     * carries on -- and provisioning fetches a smaller one for
+                     * next time.
+                     */
+                    let current = self.loaded_model();
+                    let smaller = current.as_deref().and_then(smaller_than);
+
+                    match smaller {
+                        Some(smaller) if is_installed(&self.data_dir, &smaller) => {
+                            note(format!(
+                                "Transcription was running behind, so it has switched to \
+                                 {smaller}, which this machine can keep up with. Change it \
+                                 under Settings if you would rather have the larger one."
+                            ));
+                            self.request(&smaller);
+                        }
+                        Some(smaller) => note(format!(
+                            "Transcription is running behind: {waiting} utterances are still \
+                             being decoded. {smaller} would keep up, and is not downloaded \
+                             yet -- fetch it under Settings before the next service."
+                        )),
+                        None => note(format!(
+                            "Transcription is running behind: {waiting} utterances are still \
+                             being decoded, and this is already the smallest model. A \
+                             subscription or an Azure key transcribes on our machines instead."
+                        )),
+                    }
                 }
                 silence = Duration::ZERO;
                 spoke = false;
@@ -913,6 +1032,23 @@ mod tests {
         // buys nothing.
         assert_eq!(interim_pace(5_000), INTERIM_SLOWEST);
         assert_eq!(interim_pace(usize::MAX), INTERIM_SLOWEST);
+    }
+
+    #[test]
+    fn a_thin_laptop_is_never_handed_a_model_it_cannot_carry() {
+        // The bug this replaced: a Dell XPS reports twelve to sixteen threads
+        // from a chip with a few performance cores and the rest efficiency
+        // cores, was handed `small`, and was accurately described as totally
+        // useless. Thread count does not distinguish a workstation from an
+        // ultrabook, so off Apple silicon nothing above `base` is ever chosen
+        // for somebody.
+        if !cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            let chosen = recommended("en-GB");
+            assert!(
+                chosen.contains("tiny") || chosen.contains("base"),
+                "{chosen} is too large to choose unattended on this architecture",
+            );
+        }
     }
 
     #[test]
