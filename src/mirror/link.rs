@@ -141,8 +141,22 @@ fn write_line<T: Serialize>(stream: &mut TcpStream, value: &T) -> Result<()> {
 
 fn read_line<T: for<'a> Deserialize<'a>>(reader: &mut BufReader<TcpStream>) -> Result<T> {
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Err(anyhow!("the connection closed"));
+    match reader.read_line(&mut line) {
+        Ok(0) => return Err(anyhow!("the desk closed the connection")),
+        Ok(_) => {}
+        // A read timeout, which is the ordinary way a desk that has gone is
+        // discovered -- the socket stays open to a machine that is no longer
+        // answering. Said in words, because the alternative reached an operator
+        // as "Resource temporarily unavailable (os error 35)".
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            ) =>
+        {
+            return Err(anyhow!("the desk stopped answering"))
+        }
+        Err(error) => return Err(anyhow!("the connection failed: {error}")),
     }
     Ok(serde_json::from_str(&line).context("could not read what the other end sent")?)
 }
