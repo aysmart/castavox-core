@@ -66,6 +66,16 @@ rayon = "1"
 # for the GPLv2 arm of Castavox's licence.
 mdns-sd = { version = "0.21", default-features = false }
 
+# Proving a pairing without putting the secret on the wire.
+#
+# RustCrypto rather than ring, which is already here behind rustls and would
+# have cost nothing to reach for. ring is "Apache-2.0 AND ISC" with no MIT arm;
+# these are "MIT OR Apache-2.0", so the MIT arm is available and the crypto this
+# crate introduces sits on the same footing as everything else it links into a
+# GPL product and a proprietary one.
+hmac = "0.12"
+sha2 = "0.10"
+
 # Local transcription, and fetching the models it runs on.
 whisper-rs = { version = "0.16", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
