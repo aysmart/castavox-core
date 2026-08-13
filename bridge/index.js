@@ -215,7 +215,18 @@ function unreported() {
  * point. Once a session is open it is never cut off for quota.
  */
 async function openSession() {
-  const { reached, ok, detail } = await broker("session/start", {});
+  // What this build can actually speak, so the broker never hands back a
+  // credential for a service this copy has never heard of.
+  //
+  // It is the thing that makes the provider switch safe to throw. Churches
+  // update on their own schedule -- some of them a year late -- and a bridge
+  // from before Deepgram existed, handed a Deepgram token and no region,
+  // refuses to start at all. Saying so here means an old install keeps working
+  // on Azure and a new one moves, without anybody choosing which churches find
+  // out on a Sunday.
+  const { reached, ok, detail } = await broker("session/start", {
+    speaks: ["azure", "deepgram"],
+  });
   if (!reached) {
     fail("Could not reach your Castavox subscription. Check the internet connection.", true);
     return false;
@@ -269,11 +280,20 @@ async function heartbeat() {
   const { reached, ok, status, detail } = await broker("session/heartbeat", {
     sessionId: session.id,
     seconds: used,
+    // Repeated, for the same reason it is sent at the start: the renewed token
+    // is what the next reconnection uses, and it has to be for a service this
+    // copy can talk to.
+    speaks: ["azure", "deepgram"],
   });
 
   if (ok) {
     // The broker recorded it, so it must not be sent twice.
     reportedSeconds += used;
+    // A switch thrown between heartbeats reaches us here, and takes effect at
+    // the next reconnection rather than interrupting the one we are on.
+    if (detail.provider) providerName = detail.provider === "deepgram" ? "deepgram" : "azure";
+    if (detail.model) deepgramModel = String(detail.model);
+    if (detail.region) hostedRegion = detail.region;
     if (detail.token) {
       authToken = detail.token;
       // Azure's SDK carries a renewed token into its next connection without
