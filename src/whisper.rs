@@ -11,10 +11,17 @@
 //! Stated plainly because the operator should choose knowing it.
 //!
 //! Azure streams: words arrive as they are spoken and a verse can be found
-//! mid-sentence. Whisper decodes a finished stretch of audio, so a verse
-//! arrives a second or two after the sentence ends. Cutting on silence keeps
-//! that gap short, but it cannot be removed -- the model needs the whole
-//! utterance before it can transcribe it.
+//! mid-sentence. Whisper decodes a stretch of audio, so a verse arrives a
+//! second or two after the sentence ends. Cutting on silence keeps that gap
+//! short, but it cannot be removed -- the model needs a finished stretch before
+//! it can transcribe it.
+//!
+//! The growing buffer is also decoded while the sentence is still being spoken,
+//! and those interims go to the detector as well as to the screen, so a
+//! quotation can be caught before the speaker stops. How often that happens is
+//! paced off how long the last one took on this machine: a fast one gets an
+//! interim every 600 ms and something close to Azure's behaviour, and a slow one
+//! is unchanged, which is to say it waits for the sentence to end.
 //!
 //! Accuracy is lower too, most visibly on names and places, and detection is
 //! only ever as good as the transcript it reads.
@@ -78,8 +85,22 @@ const END_SILENCE: Duration = Duration::from_millis(650);
 /// A speaker who never pauses still has to be transcribed eventually.
 const MAX_UTTERANCE: Duration = Duration::from_secs(18);
 /// How often the growing buffer is decoded to show words before the sentence
-/// ends. Every interim costs a full decode, so this is deliberately unhurried.
+/// ends, before anything has been measured. Every interim costs a full decode
+/// of everything said so far, so the first one is deliberately unhurried.
 const INTERIM_EVERY: Duration = Duration::from_millis(2_200);
+/// The slowest this ever goes, which is what it did at every speed until the
+/// pacing below existed. A machine that cannot afford interims is already
+/// skipping them while the decoder is busy, so there is nothing to gain by
+/// backing off further.
+const INTERIM_SLOWEST: Duration = INTERIM_EVERY;
+/// The fastest. Below this the words on screen churn faster than anyone reads
+/// them, the detector throttles the extra away at 250 ms anyway, and the CPU is
+/// wanted for the settled decode that follows.
+const INTERIM_FASTEST: Duration = Duration::from_millis(600);
+/// What fraction of the time a machine may spend on interims: one part decoding
+/// to two parts not. An interim is a courtesy and the settled utterance is the
+/// transcript, so the courtesy never gets the majority of the processor.
+const INTERIM_DUTY: u32 = 3;
 /// Settled utterances outstanding before the operator is told the machine is
 /// losing. Three is a genuine backlog rather than one slow decode.
 const BEHIND_AFTER: usize = 3;
@@ -164,6 +185,21 @@ fn installed_files(data_dir: &Path) -> Vec<String> {
         .filter_map(|e| e.file_name().into_string().ok())
         .filter(|name| name.starts_with("ggml-") && name.ends_with(".bin"))
         .collect()
+}
+
+/// How long to wait before decoding the growing buffer again, from how long the
+/// last such decode took on this machine.
+///
+/// Nothing measured yet means the unhurried default: the first interim of a
+/// session should not be the one that finds out the machine is slow.
+fn interim_pace(last_decode_ms: usize) -> Duration {
+    if last_decode_ms == 0 {
+        return INTERIM_EVERY;
+    }
+    Duration::from_millis(last_decode_ms as u64)
+        .checked_mul(INTERIM_DUTY)
+        .unwrap_or(INTERIM_SLOWEST)
+        .clamp(INTERIM_FASTEST, INTERIM_SLOWEST)
 }
 
 /// The sizes that are ever chosen for somebody, smallest first.
@@ -533,7 +569,8 @@ impl Local {
         let mut waiting = 0usize;
         let mut warned = false;
 
-        let (jobs, decoded, done, worker) = Arc::clone(self).decoder(&stop, interim, final_text);
+        let (jobs, decoded, done, took_ms, worker) =
+            Arc::clone(self).decoder(&stop, interim, final_text);
 
         while !stop.load(Ordering::Relaxed) {
             let Ok(chunk) = pcm.recv() else { break };
@@ -608,15 +645,26 @@ impl Local {
                 continue;
             }
 
-            // Something on screen while the sentence is still being said, and
-            // the first thing to go when the machine cannot keep up. Skipped
-            // outright while the decoder is busy: an interim is a courtesy, and
-            // queueing them is what turns a slow machine into a stuck one --
-            // each decode covers a longer buffer than the last, so every one
-            // takes longer than the interval that triggers it.
+            /*
+             * Something on screen while the sentence is still being said, and
+             * the first thing to go when the machine cannot keep up. Skipped
+             * outright while the decoder is busy: an interim is a courtesy, and
+             * queueing them is what turns a slow machine into a stuck one --
+             * each decode covers a longer buffer than the last, so every one
+             * takes longer than the interval that triggers it.
+             *
+             * How often is measured rather than fixed. 2.2 seconds was one
+             * number for every machine, and it was chosen for the slowest: on an
+             * Apple silicon laptop running tiny.en a partial decode is over in a
+             * fraction of a second, and waiting out the rest of the interval is
+             * two seconds a verse arrives later than it needed to. So the pace
+             * follows the last decode -- three times however long it took --
+             * between the floor and what it always used to be.
+             */
+            let pace = interim_pace(took_ms.load(Ordering::Relaxed));
             if spoke
                 && held >= MIN_UTTERANCE
-                && last_interim.elapsed() >= INTERIM_EVERY
+                && last_interim.elapsed() >= pace
                 && !decoded.load(Ordering::Relaxed)
             {
                 let _ = jobs.send(Job::Partial(buffer.clone()));
@@ -646,6 +694,9 @@ impl Local {
     }
 
     /// What the decoder has been handed.
+    /// Returns the queue, whether it is busy, how many settled utterances it
+    /// has finished, how long the last partial decode took in milliseconds, and
+    /// the thread itself.
     fn decoder(
         self: Arc<Self>,
         stop: &Arc<AtomicBool>,
@@ -654,6 +705,7 @@ impl Local {
     ) -> (
         std::sync::mpsc::Sender<Job>,
         Arc<AtomicBool>,
+        Arc<AtomicUsize>,
         Arc<AtomicUsize>,
         Option<std::thread::JoinHandle<()>>,
     ) {
@@ -664,9 +716,13 @@ impl Local {
         let (tx, rx) = std::sync::mpsc::channel::<Job>();
         let busy = Arc::new(AtomicBool::new(false));
         let finished = Arc::new(AtomicUsize::new(0));
+        // Zero until the first partial decode has been timed, which is what the
+        // pacing above reads as "nothing measured yet".
+        let took_ms = Arc::new(AtomicUsize::new(0));
 
         let working = Arc::clone(&busy);
         let counted = Arc::clone(&finished);
+        let timed = Arc::clone(&took_ms);
         let stop = Arc::clone(stop);
         let engine = self;
 
@@ -684,8 +740,20 @@ impl Local {
                     let audio = match &job {
                         Job::Settled(audio) | Job::Partial(audio) => audio,
                     };
+                    let began = Instant::now();
                     let spoken = engine.transcribe(audio);
                     working.store(false, Ordering::Relaxed);
+
+                    // Only the partials. A settled decode covers the whole
+                    // utterance and so takes longer than any interim of it
+                    // will, and pacing interims off that number would make a
+                    // fast machine wait for no reason.
+                    if matches!(job, Job::Partial(_)) {
+                        timed.store(
+                            began.elapsed().as_millis().min(usize::MAX as u128) as usize,
+                            Ordering::Relaxed,
+                        );
+                    }
 
                     if matches!(job, Job::Settled(_)) {
                         counted.fetch_add(1, Ordering::Relaxed);
@@ -700,7 +768,7 @@ impl Local {
             })
             .ok();
 
-        (tx, busy, finished, worker)
+        (tx, busy, finished, took_ms, worker)
     }
 }
 
@@ -772,6 +840,26 @@ mod tests {
         assert_eq!(decode_language("", false), "en");
         assert_eq!(decode_language("qq-ZZ", false), "en");
         assert_eq!(decode_language("klingon", false), "en");
+    }
+
+    #[test]
+    fn interims_go_as_fast_as_the_machine_affords_and_no_faster() {
+        // Nothing measured: the unhurried default, which is what this did at
+        // every speed before it was measured at all.
+        assert_eq!(interim_pace(0), INTERIM_EVERY);
+
+        // A fast machine -- Apple silicon on tiny.en, a partial decode over in
+        // 120 ms -- gets the floor rather than two seconds of waiting.
+        assert_eq!(interim_pace(120), INTERIM_FASTEST);
+
+        // In between, three times the decode: one part working, two parts not.
+        assert_eq!(interim_pace(400), Duration::from_millis(1_200));
+
+        // A slow one never goes slower than it always did. It is already
+        // skipping interims while the decoder is busy, so backing off further
+        // buys nothing.
+        assert_eq!(interim_pace(5_000), INTERIM_SLOWEST);
+        assert_eq!(interim_pace(usize::MAX), INTERIM_SLOWEST);
     }
 
     #[test]
