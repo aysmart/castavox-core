@@ -1,9 +1,9 @@
 /**
- * The Azure Speech bridge, shared by Castavox and Pulpitry.
+ * The streaming speech bridge, shared by Castavox and Pulpitry.
  *
  * Reads raw PCM on stdin (16 kHz, 16-bit little-endian, mono — written by the
- * Rust capture thread), streams it to Azure Speech, and writes newline-delimited
- * JSON transcript events to stdout.
+ * Rust capture thread), streams it to a speech service, and writes
+ * newline-delimited JSON transcript events to stdout.
  *
  * # Canonical source
  *
@@ -33,12 +33,24 @@
  *   {"type":"reconnecting","message":"..."}
  *   {"type":"error","message":"...","fatal":bool}
  *
- * # Two ways to authenticate
+ * # Two ways to authenticate, and two services
  *
  * With the church's own Azure key (CASTAVOX_SPEECH_KEY), which is how this has
  * always worked, or on a hosted subscription (CASTAVOX_BROKER_URL and
- * CASTAVOX_DEVICE_TOKEN), where the broker hands out a ten-minute Azure token
+ * CASTAVOX_DEVICE_TOKEN), where the broker hands out a short-lived token
  * against a plan it meters.
+ *
+ * A hosted session runs on whichever service the broker names when it opens
+ * the session — Azure, or Deepgram at about a third the price for the same
+ * audio hour. **The choice is the broker\'s, per session, and this file simply
+ * does as it is told.** That is what makes the migration reversible: if verse
+ * detection turns out worse on a real Sunday it goes back by changing one
+ * variable on a server, without releasing two desktop applications and without
+ * leaving anybody on a worse transcript while a build runs. An older broker
+ * that names nothing means Azure, which is what it was already doing.
+ *
+ * A church on its own key is always Azure. That account is theirs, none of
+ * this reaches it, and we are not about to ask a church to open a second one.
  *
  * The hosted session lives here rather than in Rust because this process's
  * lifetime *is* the session: it opens one before listening, renews it on a
@@ -61,6 +73,10 @@
 console.log = (...args) => console.error(...args);
 
 const sdk = require("microsoft-cognitiveservices-speech-sdk");
+// Already in the tree -- the Speech SDK's own transport -- but declared as a
+// dependency of this bundle rather than borrowed from theirs, so a version of
+// the SDK that stops using it cannot take our other transport with it.
+const WebSocket = require("ws");
 
 const KEY = process.env.CASTAVOX_SPEECH_KEY || "";
 const REGION = process.env.CASTAVOX_SPEECH_REGION || "";
@@ -89,6 +105,8 @@ const FATAL_ERROR_CODES = new Set([
 
 let pushStream = null;
 let recognizer = null;
+/** Whichever service this run is speaking to, once it has been built. */
+let transport = null;
 let restartTimer = null;
 let shuttingDown = false;
 
@@ -96,6 +114,13 @@ let shuttingDown = false;
 let session = null;
 let authToken = "";
 let hostedRegion = "";
+/**
+ * Which service this run speaks to. The broker decides it; a church on its own
+ * key is Azure and never asks.
+ */
+let providerName = "azure";
+/** Deepgram's model, named by the broker so it can change without a release. */
+let deepgramModel = "nova-3";
 let heartbeatTimer = null;
 /** Streamed and already billed, so a heartbeat reports the difference. */
 let streamedBytes = 0;
@@ -208,7 +233,16 @@ async function openSession() {
   };
   authToken = detail.token || "";
   hostedRegion = detail.region || "";
-  if (!authToken || !hostedRegion) {
+  // Absent means Azure. A broker older than the second service says nothing
+  // here, and what it says nothing about is what it was already doing.
+  providerName = detail.provider === "deepgram" ? "deepgram" : "azure";
+  if (detail.model) deepgramModel = String(detail.model);
+
+  // Azure is addressed at a regional endpoint and Deepgram at one host, so
+  // what counts as a usable credential differs. Checked here, before any audio
+  // moves, rather than as a connection failure thirty seconds into a sermon.
+  const usable = authToken && (providerName === "deepgram" || hostedRegion);
+  if (!usable) {
     fail("Your Castavox subscription did not return a usable credential.", true);
     return false;
   }
@@ -242,9 +276,11 @@ async function heartbeat() {
     reportedSeconds += used;
     if (detail.token) {
       authToken = detail.token;
-      // Set on the live recogniser, which is what carries it into the next
-      // connection without interrupting this one.
-      if (recognizer) recognizer.authorizationToken = detail.token;
+      // Azure's SDK carries a renewed token into its next connection without
+      // interrupting this one. Deepgram authenticates the handshake and
+      // nothing after it, so an established connection is unaffected by its
+      // token expiring and the new one simply waits for the next reconnection.
+      if (providerName === "azure" && recognizer) recognizer.authorizationToken = detail.token;
     }
     if (Number(detail.heartbeatSeconds) > 0) session.heartbeatSeconds = Number(detail.heartbeatSeconds);
   } else if (status === 402) {
@@ -282,6 +318,182 @@ async function closeSession() {
   session = null;
   clearTimeout(heartbeatTimer);
   await broker("session/end", { sessionId: ending.id, seconds: unreported() });
+}
+
+/**
+ * Deepgram's language parameter, from the locale the operator chose.
+ *
+ * Their English models take a BCP-47 tag and behave; everything else is asked
+ * for as `multi`, nova-3's multilingual mode. Passing "yo-NG" straight through
+ * would be rejected at the handshake, and a church that selected Yoruba would
+ * meet a connection error rather than a transcript -- which is a worse answer
+ * than a model that will at least try.
+ */
+function deepgramLanguage() {
+  return /^en(-|$)/i.test(LANGUAGE) ? LANGUAGE : "multi";
+}
+
+/**
+ * Transcription over Deepgram's streaming WebSocket.
+ *
+ * Presents the same three operations as the Azure transport below -- start,
+ * write, stop -- and emits the same messages, so nothing downstream of this
+ * file knows or cares which service produced a word.
+ *
+ * # Which results are final
+ *
+ * Deepgram marks a segment `is_final` when it will not revise it again, and
+ * separately marks `speech_final` at an endpoint. `is_final` is what becomes a
+ * "recognized" here: the detector's contract is a confirmed transcript segment,
+ * those segments are confirmed and do not overlap, and waiting for the endpoint
+ * would hold a finished clause back until the speaker drew breath.
+ */
+function buildDeepgram() {
+  const query = new URLSearchParams({
+    model: deepgramModel,
+    language: deepgramLanguage(),
+    encoding: "linear16",
+    sample_rate: String(SAMPLE_RATE),
+    channels: "1",
+    interim_results: "true",
+    punctuate: "true",
+    smart_format: "true",
+    // 800 ms of silence ends an utterance, the same figure the Azure side is
+    // configured with and for the same reason: preaching pauses for effect,
+    // and a shorter one cuts a sentence in half.
+    endpointing: "800",
+    // Return a result as soon as it is ready rather than waiting to batch it.
+    no_delay: "true",
+  });
+
+  const socket = new WebSocket(`wss://api.deepgram.com/v1/listen?${query}`, {
+    headers: {
+      // A granted token, not our key. The key never leaves the broker.
+      authorization: HOSTED ? `Bearer ${authToken}` : `Token ${KEY}`,
+    },
+    handshakeTimeout: REQUEST_TIMEOUT_MS,
+  });
+
+  /*
+   * Audio that arrived before the socket finished opening.
+   *
+   * Capture starts the moment the operator presses Listen and the handshake
+   * takes a round trip, so there is always some -- and on a reconnection there
+   * is more. Azure's push stream swallows it for us; a WebSocket cannot send
+   * before it is open, and a transport that quietly dropped it would lose the
+   * first words of every service and the first words after every blip.
+   *
+   * Bounded, because a socket that never opens must not grow this forever.
+   * Past the bound `write` says so, and what it refuses is not billed.
+   */
+  const pending = [];
+  let pendingBytes = 0;
+  const PENDING_LIMIT = BYTES_PER_SECOND * 5;
+
+  socket.on("open", () => {
+    emit({ type: "listening" });
+    for (const chunk of pending.splice(0)) socket.send(chunk);
+    pendingBytes = 0;
+  });
+
+  socket.on("message", (data) => {
+    let payload;
+    try {
+      payload = JSON.parse(data.toString());
+    } catch {
+      // Not ours to interpret. Deepgram sends JSON; anything else is a version
+      // of their protocol this does not know, and dropping it is better than
+      // crashing a service over it.
+      return;
+    }
+    if (payload.type === "Error") {
+      scheduleRestart(payload.description || payload.message || "the speech service reported an error");
+      return;
+    }
+    if (payload.type !== "Results") return;
+
+    const alternative = payload.channel && payload.channel.alternatives && payload.channel.alternatives[0];
+    const text = alternative && alternative.transcript;
+    if (!text) return;
+
+    if (!payload.is_final) {
+      emit({ type: "recognizing", text });
+      return;
+    }
+    emit({
+      type: "recognized",
+      text,
+      // Seconds here, where Azure reports ticks. Both leave as milliseconds.
+      offsetMs: Math.round(Number(payload.start || 0) * 1000),
+      durationMs: Math.round(Number(payload.duration || 0) * 1000),
+    });
+  });
+
+  // A refused upgrade, which is what a bad or expired token looks like.
+  // Retrying cannot fix either, so it is reported rather than reconnected.
+  socket.on("unexpected-response", (_request, response) => {
+    const status = response && response.statusCode;
+    if (status === 401 || status === 403) {
+      fail(`Deepgram rejected the connection (${status}).`, true);
+      shutdown(1);
+      return;
+    }
+    scheduleRestart(`the speech service answered ${status || "an error"}`);
+  });
+
+  socket.on("error", (err) => scheduleRestart(describe(err)));
+
+  socket.on("close", (code) => {
+    // 1000 after we asked to stop is the ordinary end of a run. Anything else
+    // arriving while we are still listening is a connection to rebuild.
+    if (shuttingDown || code === 1000) return;
+    scheduleRestart(`the speech service closed the connection (${code})`);
+  });
+
+  return {
+    kind: "deepgram",
+    socket,
+    write(chunk) {
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(chunk);
+        return true;
+      }
+      // Held until the handshake finishes. Counted as sent, because it will be.
+      if (socket.readyState === WebSocket.CONNECTING && pendingBytes + chunk.byteLength <= PENDING_LIMIT) {
+        pending.push(Buffer.from(chunk));
+        pendingBytes += chunk.byteLength;
+        return true;
+      }
+      return false;
+    },
+    stop() {
+      return new Promise((done) => {
+        if (socket.readyState !== WebSocket.OPEN) {
+          try {
+            socket.terminate();
+          } catch {
+            /* already gone */
+          }
+          return done();
+        }
+        // Asks for the last of the audio to be transcribed before the socket
+        // goes. Without it the closing seconds of a sermon are simply dropped.
+        socket.once("close", done);
+        try {
+          socket.send(JSON.stringify({ type: "CloseStream" }));
+        } catch {
+          done();
+        }
+      });
+    },
+    close() {
+      try {
+        socket.terminate();
+      } catch {
+        /* already gone */
+      }
+    },
+  };
 }
 
 function buildRecognizer() {
@@ -330,40 +542,78 @@ function buildRecognizer() {
   return speech;
 }
 
+/** The Azure recogniser, behind the same three operations as the other one. */
+function buildAzure() {
+  recognizer = buildRecognizer();
+  const speech = recognizer;
+
+  speech.startContinuousRecognitionAsync(
+    () => {},
+    (err) => scheduleRestart(describe(err)),
+  );
+
+  return {
+    kind: "azure",
+    write(chunk) {
+      if (!pushStream) return false;
+      // The SDK wants an ArrayBuffer; slice so a pooled Buffer's neighbours
+      // don't get sent along with it.
+      pushStream.write(chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength));
+      return true;
+    },
+    stop() {
+      return new Promise((done) => {
+        try {
+          speech.stopContinuousRecognitionAsync(() => {
+            try {
+              speech.close();
+            } catch {
+              /* ignore */
+            }
+            done();
+          }, done);
+        } catch {
+          done();
+        }
+      });
+    },
+    close() {
+      try {
+        speech.close();
+      } catch {
+        /* already torn down */
+      }
+    },
+  };
+}
+
 function startRecognition() {
   try {
-    recognizer = buildRecognizer();
+    transport = providerName === "deepgram" ? buildDeepgram() : buildAzure();
   } catch (err) {
     fail(`Could not initialise the speech recogniser: ${describe(err)}`, true);
     shutdown(1);
     return;
   }
-
-  recognizer.startContinuousRecognitionAsync(
-    () => {},
-    (err) => scheduleRestart(describe(err)),
-  );
 }
 
 /**
- * Rebuilds the recogniser after a recoverable failure. Closing a recogniser
- * also closes its push stream, so a fresh stream is created each time and
- * stdin is re-pointed at it.
+ * Rebuilds the connection after a recoverable failure.
+ *
+ * Closing an Azure recogniser also closes its push stream, so a fresh stream is
+ * created each time and stdin is re-pointed at it. A Deepgram socket has no
+ * such attachment, but the shape is the same: whatever is there is dropped and
+ * a new one is built.
  */
 function scheduleRestart(reason) {
   if (shuttingDown || restartTimer) return;
   emit({ type: "reconnecting", message: reason });
 
-  const dying = recognizer;
+  const dying = transport;
+  transport = null;
   recognizer = null;
   pushStream = null;
-  if (dying) {
-    try {
-      dying.close();
-    } catch {
-      /* already torn down */
-    }
-  }
+  if (dying) dying.close();
 
   restartTimer = setTimeout(() => {
     restartTimer = null;
@@ -403,21 +653,7 @@ function shutdown(code) {
 
   const closed = closeSession();
 
-  const stopped = new Promise((done) => {
-    if (!recognizer) return done();
-    try {
-      recognizer.stopContinuousRecognitionAsync(() => {
-        try {
-          recognizer.close();
-        } catch {
-          /* ignore */
-        }
-        done();
-      }, done);
-    } catch {
-      done();
-    }
-  });
+  const stopped = transport ? transport.stop() : Promise.resolve();
 
   // Settled, not successful: a close the broker refused has been reported as
   // well as it can be from here, and the parent closes it again regardless.
@@ -440,15 +676,11 @@ async function main() {
   }
 
   process.stdin.on("data", (chunk) => {
-    if (!pushStream || shuttingDown) return;
+    if (!transport || shuttingDown) return;
     try {
-      // The SDK wants an ArrayBuffer; slice so a pooled Buffer's neighbours
-      // don't get sent along with it.
-      pushStream.write(
-        chunk.buffer.slice(chunk.byteOffset, chunk.byteOffset + chunk.byteLength),
-      );
-      // Counted after the write, so audio the stream refused is not billed.
-      streamedBytes += chunk.byteLength;
+      // Counted only when the transport took it, so audio dropped on the floor
+      // during a reconnection is not billed to a church that never heard it.
+      if (transport.write(chunk)) streamedBytes += chunk.byteLength;
     } catch (err) {
       scheduleRestart(`audio stream rejected input: ${describe(err)}`);
     }

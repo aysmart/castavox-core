@@ -69,6 +69,62 @@ module.exports = {
 `;
 
 /**
+ * A stub `ws` that plays Deepgram.
+ *
+ * Reports the URL and the Authorization header it was handed, so a test can
+ * prove the granted token went where it should and our key did not. Once audio
+ * arrives it answers the way Deepgram does — an interim, then a final — which
+ * is what makes this a test of the transport rather than of the constructor.
+ */
+const STUB_WS = `
+"use strict";
+const { EventEmitter } = require("events");
+const say = (line) => process.stderr.write(line + "\\n");
+
+class Socket extends EventEmitter {
+  constructor(url, options) {
+    super();
+    say("WS:" + url);
+    say("AUTH:" + ((options && options.headers && options.headers.authorization) || ""));
+    this.readyState = 0;
+    setTimeout(() => {
+      this.readyState = 1;
+      this.emit("open");
+    }, 5);
+  }
+  send(data) {
+    if (typeof data === "string") {
+      say("SENT:" + data);
+      if (JSON.parse(data).type === "CloseStream") {
+        this.readyState = 3;
+        setTimeout(() => this.emit("close", 1000), 5);
+      }
+      return;
+    }
+    say("AUDIO:" + data.length);
+    if (this._answered) return;
+    this._answered = true;
+    const results = (is_final, transcript) =>
+      this.emit("message", Buffer.from(JSON.stringify({
+        type: "Results",
+        is_final,
+        start: 1.5,
+        duration: 2.25,
+        channel: { alternatives: [{ transcript }] },
+      })));
+    setTimeout(() => results(false, "in the beginning"), 5);
+    setTimeout(() => results(true, "In the beginning was the Word."), 10);
+  }
+  terminate() { this.readyState = 3; }
+  close() { this.readyState = 3; }
+}
+
+Socket.CONNECTING = 0;
+Socket.OPEN = 1;
+module.exports = Socket;
+`;
+
+/**
  * The same stub, but one that never acknowledges a stop.
  *
  * What a dead connection does. Derived from the stub above rather than written
@@ -79,13 +135,17 @@ const STUB_SDK_STOP_HANGS = STUB_SDK.replace(
   "stopContinuousRecognitionAsync() { say('STOP:ignored'); }",
 );
 
-/** The bridge, beside a fake node_modules so it resolves the stub. */
-function stage(sdk = STUB_SDK) {
+/** The bridge, beside a fake node_modules so it resolves the stubs. */
+function stage(sdk = STUB_SDK, ws = STUB_WS) {
   const dir = mkdtempSync(resolve(tmpdir(), "bridge-test-"));
-  const module = resolve(dir, "node_modules/microsoft-cognitiveservices-speech-sdk");
-  mkdirSync(module, { recursive: true });
-  writeFileSync(resolve(module, "index.js"), sdk);
-  writeFileSync(resolve(module, "package.json"), '{"name":"microsoft-cognitiveservices-speech-sdk","main":"index.js"}');
+  const put = (name, source) => {
+    const module = resolve(dir, "node_modules", name);
+    mkdirSync(module, { recursive: true });
+    writeFileSync(resolve(module, "index.js"), source);
+    writeFileSync(resolve(module, "package.json"), `{"name":"${name}","main":"index.js"}`);
+  };
+  put("microsoft-cognitiveservices-speech-sdk", sdk);
+  put("ws", ws);
   copyFileSync(resolve(here, "index.js"), resolve(dir, "index.js"));
   return dir;
 }
@@ -352,6 +412,88 @@ describe("a hosted session", () => {
     const reported = run.events.find((e) => e.type === "error");
     strictEqual(reported.message, "This subscription has ended.");
     strictEqual(reported.fatal, true);
+  });
+
+  it("runs on Deepgram when the broker says so, and meters it the same way", async () => {
+    const { server, calls } = broker({
+      "session/start": () => ({
+        status: 200,
+        body: {
+          sessionId: "sess-dg",
+          provider: "deepgram",
+          token: "granted-token",
+          model: "nova-3",
+          heartbeatSeconds: 1,
+        },
+      }),
+      "session/heartbeat": () => ({ status: 200, body: { token: "granted-again", heartbeatSeconds: 1 } }),
+      "session/end": () => ({ status: 200, body: { ended: true } }),
+    });
+    servers.push(server);
+    const url = await listen(server);
+    const run = start(stage(), url);
+
+    await until(() => run.stderr().includes("WS:"), "the socket");
+
+    // The granted token, as a bearer. Our own Deepgram key is never here.
+    match(run.stderr(), /AUTH:Bearer granted-token/);
+    // And the model came from the broker, so changing it needs no release.
+    match(run.stderr(), /WS:wss:\/\/api\.deepgram\.com\/v1\/listen\?.*model=nova-3/);
+    // No region: Deepgram has one host, and a session that demanded one would
+    // refuse to start against a broker that rightly did not send it.
+    ok(!run.stderr().includes("BUILT:"), "should not have built an Azure recogniser");
+
+    // The session id still goes out first, so the parent can close a session
+    // this process is killed before finishing.
+    strictEqual(run.events[0].type, "session");
+    strictEqual(run.events[0].id, "sess-dg");
+
+    run.child.stdin.write(Buffer.alloc(BYTES_PER_SECOND * 2));
+
+    // Deepgram's is_final becomes our recognized; anything else is an interim.
+    await until(() => run.events.some((e) => e.type === "recognized"), "a final result");
+    const interim = run.events.find((e) => e.type === "recognizing");
+    strictEqual(interim.text, "in the beginning");
+    const final = run.events.find((e) => e.type === "recognized");
+    strictEqual(final.text, "In the beginning was the Word.");
+    // Seconds on the wire, milliseconds out -- the same shape Azure produces
+    // from ticks, because nothing downstream knows which service spoke.
+    strictEqual(final.offsetMs, 1500);
+    strictEqual(final.durationMs, 2250);
+
+    // Metering is the transport's business only in that it must not change:
+    // seconds streamed, reported as a difference and not a total.
+    await until(() => calls.some((c) => c.path === "session/heartbeat"), "the heartbeat");
+    strictEqual(calls.find((c) => c.path === "session/heartbeat").payload.seconds, 2);
+
+    run.child.stdin.end();
+    strictEqual(await run.exited, 0);
+
+    // Asked for the last of the audio before the socket went. Without it the
+    // closing seconds of a sermon are simply dropped.
+    match(run.stderr(), /SENT:{"type":"CloseStream"}/);
+    ok(calls.some((c) => c.path === "session/end"), "should have closed the session");
+  });
+
+  it("asks Deepgram for its multilingual model when the service is not in English", async () => {
+    const { server } = broker({
+      "session/start": () => ({
+        status: 200,
+        body: { sessionId: "sess-yo", provider: "deepgram", token: "t", heartbeatSeconds: 60 },
+      }),
+      "session/end": () => ({ status: 200, body: {} }),
+    });
+    servers.push(server);
+    const url = await listen(server);
+    const run = start(stage(), url, { CASTAVOX_SPEECH_LANGUAGE: "yo-NG" });
+
+    await until(() => run.stderr().includes("WS:"), "the socket");
+    // "yo-NG" would be refused at the handshake, and a church that chose
+    // Yoruba would meet a connection error rather than a transcript.
+    match(run.stderr(), /language=multi/);
+
+    run.child.kill("SIGTERM");
+    await run.exited;
   });
 
   it("still works on a church's own key, with no broker at all", async () => {
