@@ -112,5 +112,12 @@ whisper-rs = { version = "0.16", default-features = false, features = ["metal"] 
 # The cost is a build-time dependency: the Vulkan SDK has to be on the machine
 # that *compiles* this, which means the Windows runner needs a step to install
 # it, and getting that wrong fails at link time rather than at run time.
-[target.'cfg(target_os = "windows")'.dependencies]
+#
+# x86_64 only, and the reason is that build-time cost rather than anything about
+# the hardware. The SDK installer the runners use publishes no arm64 Windows
+# package, so an arm64 build with this feature on fails to link -- it does not
+# quietly fall back, because the fallback is a run-time one and this fails
+# before that. Windows on ARM therefore stays on the CPU, which is what shipped
+# before any of this, and it is a smaller loss than no arm64 build at all.
+[target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
 whisper-rs = { version = "0.16", default-features = false, features = ["vulkan"] }
