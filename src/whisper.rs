@@ -232,7 +232,13 @@ pub fn recommended(locale: &str) -> String {
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
     let size = match cores {
         0..=3 => "tiny",
-        4..=9 => "base",
+        // `small` needs a genuinely large machine, and the threshold is high
+        // because this number is not comparable across architectures: it counts
+        // hardware threads, so an 8-core Intel reports 16 while an 8-core Apple
+        // silicon reports 8 and is the faster of the two at this work. Set low
+        // enough to catch the Intel, it hands 466 MB to a mid-range laptop that
+        // then has to be stepped back down.
+        4..=11 => "base",
         _ => "small",
     };
     named(size, english(locale))
