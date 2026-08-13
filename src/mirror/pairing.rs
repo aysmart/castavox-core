@@ -100,6 +100,10 @@ pub struct Challenge {
     /// Whether a code is being offered right now, so the screen can say
     /// "ask them to press Pair" rather than failing with nothing to act on.
     pub pairing_open: bool,
+    /// What the desk calls itself, so the screen can name what it is about to
+    /// trust *before* it commits to it. Not a disclosure: the same name is in
+    /// the mDNS advertisement, which anything on the network can already read.
+    pub desk: String,
 }
 
 /// What the screen answers with.
@@ -116,8 +120,14 @@ pub enum Answer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Verdict {
-    /// Come in. On a `Pair` this is also when both ends derived the token.
-    Ready { name: String },
+    /// Come in.
+    ///
+    /// `you` is what the desk now knows the *screen* as, not what the desk
+    /// calls itself — the desk's own name is in the challenge. Named this way
+    /// because the previous spelling was `name`, and the screen duly reported
+    /// its own name back to its operator as the name of the desk it had
+    /// connected to.
+    Ready { you: String },
     /// Not coming in, and why — in words the operator at the *screen* can act
     /// on, since that is who will read it.
     Refused { reason: String },
@@ -230,8 +240,8 @@ impl Doorkeeper {
         })
     }
 
-    pub fn challenge(&self, nonce: String, now: Instant) -> Challenge {
-        Challenge { nonce, pairing_open: self.pairing_open(now) }
+    pub fn challenge(&self, nonce: String, desk: &str, now: Instant) -> Challenge {
+        Challenge { nonce, pairing_open: self.pairing_open(now), desk: desk.to_string() }
     }
 
     /// Everything remembered, for the product to persist.
@@ -255,7 +265,7 @@ impl Doorkeeper {
         match answer {
             Answer::Hello { id, proof } => match self.known.get(id) {
                 Some(pairing) if same(proof, &prove(&pairing.token, nonce)) => {
-                    Verdict::Ready { name: pairing.name.clone() }
+                    Verdict::Ready { you: pairing.name.clone() }
                 }
                 // Both cases give the same answer on purpose. "I know that
                 // machine but not that proof" tells anybody asking which ids
@@ -299,7 +309,7 @@ impl Doorkeeper {
                 // reason to expect that a code they read out once still works.
                 self.offered = None;
 
-                Verdict::Ready { name: name.clone() }
+                Verdict::Ready { you: name.clone() }
             }
         }
     }
@@ -401,7 +411,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(verdict, Verdict::Ready { name: "Stream machine".into() });
+        assert_eq!(verdict, Verdict::Ready { you: "Stream machine".into() });
         assert_eq!(door.pairings().len(), 1);
 
         // And is remembered: the next connection proves the token instead, and
@@ -414,7 +424,7 @@ mod tests {
                 &later,
                 Instant::now(),
             ),
-            Verdict::Ready { name: "Stream machine".into() },
+            Verdict::Ready { you: "Stream machine".into() },
         );
     }
 
