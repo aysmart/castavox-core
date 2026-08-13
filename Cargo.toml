@@ -51,6 +51,21 @@ candle-transformers = "0.11"
 tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
 rayon = "1"
 
+# Finding the other application on the church's wifi.
+#
+# No async runtime: this is the only crate in the tree that would have pulled
+# one in, and a tokio reactor spun up to answer multicast questions would be a
+# large thing to carry for a small one. mdns-sd runs its own thread and talks
+# over channels, which is the shape everything else here already uses.
+#
+# Licensing checked, because this crate is linked into a GPL-2.0-or-later
+# product and a proprietary one. It and its four dependencies all offer MIT --
+# mdns-sd and flume as "Apache-2.0 OR MIT", if-addrs as "MIT OR BSD-3-Clause",
+# socket-pktinfo as MIT -- so the MIT arm is taken throughout and neither
+# product has anything to reconcile. Apache-2.0 alone would have been a problem
+# for the GPLv2 arm of Castavox's licence.
+mdns-sd = { version = "0.21", default-features = false }
+
 # Local transcription, and fetching the models it runs on.
 whisper-rs = { version = "0.16", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
