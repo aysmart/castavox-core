@@ -526,6 +526,16 @@ impl Local {
         }
     }
 
+    /// Decodes one stretch of audio, for the benchmark example.
+    ///
+    /// Public only so `examples/bench.rs` can measure this machine rather than
+    /// anybody guessing at it. Loads the model on the first call, as a session
+    /// does.
+    pub fn transcribe_for_bench(&self, samples: &[f32]) -> Result<String> {
+        self.ensure(&|_| {})?;
+        self.transcribe(samples)
+    }
+
     /// Decodes one stretch of audio into plain text.
     fn transcribe(&self, samples: &[f32]) -> Result<String> {
         let guard = self.loaded.lock();

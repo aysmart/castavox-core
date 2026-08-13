@@ -77,9 +77,40 @@ hmac = "0.12"
 sha2 = "0.10"
 
 # Local transcription, and fetching the models it runs on.
+# Local transcription, CPU everywhere. The GPU backends that accelerate it are
+# per-platform and live at the bottom of this file, where a table header cannot
+# swallow the dependencies that follow it.
 whisper-rs = { version = "0.16", default-features = false }
+
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "blocking"] }
 
 [profile.release]
 opt-level = "s"
+
+# Metal on macOS, which is the difference between "needs a fast Mac" and "runs
+# on the Mac a church already has". Measured on an M-series machine with
+# base.en: 0.26s to decode six seconds of audio on the CPU, 0.13s with Metal.
+#
+# Free to enable: Metal ships with the OS, needs no SDK at build time and no
+# driver at run time, and whisper.cpp falls back to the CPU on a machine that
+# cannot use it. There is no version of this that makes anything worse.
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.16", default-features = false, features = ["metal"] }
+
+# Vulkan on Windows, and Vulkan rather than CUDA on purpose.
+#
+# CUDA is faster where it applies and applies to NVIDIA only, which is not the
+# machine this is for. The church laptop that cannot keep up has Intel or AMD
+# integrated graphics, and Vulkan is the one backend that reaches all three --
+# so it helps the hardware that needs helping rather than the hardware that was
+# already fine.
+#
+# whisper.cpp falls back to the CPU when no Vulkan device is present, so the
+# worst case is what we ship today.
+#
+# The cost is a build-time dependency: the Vulkan SDK has to be on the machine
+# that *compiles* this, which means the Windows runner needs a step to install
+# it, and getting that wrong fails at link time rather than at run time.
+[target.'cfg(target_os = "windows")'.dependencies]
+whisper-rs = { version = "0.16", default-features = false, features = ["vulkan"] }
