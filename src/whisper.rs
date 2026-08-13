@@ -211,6 +211,43 @@ fn interim_pace(last_decode_ms: usize) -> Duration {
 /// stepped down from, never as an automatic choice.
 const LADDER: [&str; 4] = ["tiny", "base", "small", "medium"];
 
+/// Whether this machine is likely to keep up with a preacher.
+///
+/// # What actually decides it
+///
+/// The CPU, and only the CPU. `whisper-rs` is built here with
+/// `default-features = false`, which compiles in no Metal, no CUDA and no
+/// CoreML — so decoding runs on the processor on every platform, and a discrete
+/// graphics card contributes nothing at all. Advice that sends a church out to
+/// buy a gaming laptop for the GPU is advice to spend money on a part this
+/// build cannot use.
+///
+/// So: Apple silicon, which is fast at this because of wide vector units and
+/// memory bandwidth rather than anything exotic; or an x86 machine with enough
+/// cores to be a workstation rather than an office laptop.
+///
+/// # It is a guess, and it is allowed to be
+///
+/// Nothing is refused on the strength of it. It decides whether an operator is
+/// warned before Sunday rather than after one — the engine already reports when
+/// it is running behind, and that report is the truth. This only exists so the
+/// truth does not arrive for the first time during a sermon.
+pub fn likely_keeps_up() -> bool {
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+
+    // Apple silicon: every model from the M1 up decodes faster than real time
+    // on the sizes this ships.
+    if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+        return true;
+    }
+
+    // Everything else is judged on core count, which is the only portable
+    // proxy available without a dependency that reads CPU model names. Twelve
+    // is the line between a laptop bought for spreadsheets and one bought for
+    // work that is heavy.
+    cores >= 12
+}
+
 /// The model to start with on this machine, when nobody has chosen one.
 ///
 /// Sized from the logical core count, because with no GPU backend compiled in
@@ -866,6 +903,19 @@ mod tests {
         // buys nothing.
         assert_eq!(interim_pace(5_000), INTERIM_SLOWEST);
         assert_eq!(interim_pace(usize::MAX), INTERIM_SLOWEST);
+    }
+
+    #[test]
+    fn the_capability_guess_is_about_the_processor() {
+        // Whatever it answers on the machine running the test, it must answer
+        // *something* -- and the answer must not depend on a graphics card,
+        // because this build compiles no GPU backend and cannot use one.
+        let _ = likely_keeps_up();
+
+        // On Apple silicon it is always yes; the smallest one is quick enough.
+        if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+            assert!(likely_keeps_up());
+        }
     }
 
     #[test]
