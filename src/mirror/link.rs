@@ -32,6 +32,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -53,6 +54,9 @@ pub const SILENCE_MEANS_GONE: Duration = Duration::from_secs(16);
 
 /// How long a handshake may take before the connection is abandoned.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often the accept loop looks up to see whether it has been stopped.
+const ACCEPT_POLL: Duration = Duration::from_millis(100);
 
 /// One verse of a passage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,8 +112,11 @@ pub enum Event {
     Connected { desk: String },
     Staged(Shown),
     /// The link went. **What was last staged is deliberately not cleared** —
-    /// see [`Screen`].
+    /// see [`Screen::keep_connected`].
     Dropped { reason: String },
+    /// Trying again, in this many seconds. Worth showing somewhere that is not
+    /// the stream, so an operator knows why the overlay has stopped changing.
+    Reconnecting { seconds: u64 },
     /// Refused for good: the pairing is gone or was never made. Retrying will
     /// not fix it, and the operator has to do something.
     Rejected { reason: String },
@@ -132,9 +139,16 @@ fn read_line<T: for<'a> Deserialize<'a>>(reader: &mut BufReader<TcpStream>) -> R
 }
 
 /// The desk: listens, admits, and pushes what is staged.
+///
+/// Dropping it stops it: the listener closes and every screen is disconnected.
+/// That is not tidiness — an operator who turns the mirror off in settings
+/// expects the port to close and the other machine to notice, and a `Desk` that
+/// merely went out of scope while its threads carried on would leave both true
+/// of nothing.
 pub struct Desk {
     inner: Arc<Mutex<Inner>>,
     port: u16,
+    stopped: Arc<AtomicBool>,
 }
 
 struct Inner {
@@ -152,6 +166,11 @@ impl Desk {
     pub fn start(name: &str, known: Vec<Pairing>, port: u16) -> Result<Self> {
         let listener = TcpListener::bind(("0.0.0.0", port)).context("could not open the mirror port")?;
         let port = listener.local_addr()?.port();
+        // Polled rather than blocked in `accept`, so stopping does not depend on
+        // somebody happening to connect. The alternative -- connecting to
+        // ourselves to break the block -- works and is a thing to explain
+        // forever afterwards.
+        listener.set_nonblocking(true).context("could not set the mirror port non-blocking")?;
 
         let inner = Arc::new(Mutex::new(Inner {
             door: Doorkeeper::new(known),
@@ -159,31 +178,58 @@ impl Desk {
             screens: Vec::new(),
             name: name.to_string(),
         }));
+        let stopped = Arc::new(AtomicBool::new(false));
 
         {
             let inner = Arc::clone(&inner);
+            let stopped = Arc::clone(&stopped);
             std::thread::Builder::new()
                 .name("castavox-mirror-accept".into())
                 .spawn(move || {
-                    for incoming in listener.incoming() {
-                        let Ok(stream) = incoming else { continue };
-                        let inner = Arc::clone(&inner);
-                        // One thread per screen. A church has one or two, and a
-                        // handshake that hangs must not hold up the next one.
-                        std::thread::Builder::new()
-                            .name("castavox-mirror-screen".into())
-                            .spawn(move || {
-                                if let Err(error) = serve_one(stream, inner) {
-                                    crate::log_line!("[mirror] a screen disconnected: {error:#}");
-                                }
-                            })
-                            .ok();
+                    while !stopped.load(Ordering::Relaxed) {
+                        match listener.accept() {
+                            Ok((stream, _)) => {
+                                // Blocking again for this connection: only the
+                                // accept loop needs to be interruptible.
+                                stream.set_nonblocking(false).ok();
+                                let inner = Arc::clone(&inner);
+                                // One thread per screen. A church has one or
+                                // two, and a handshake that hangs must not hold
+                                // up the next one.
+                                std::thread::Builder::new()
+                                    .name("castavox-mirror-screen".into())
+                                    .spawn(move || {
+                                        if let Err(error) = serve_one(stream, inner) {
+                                            crate::log_line!("[mirror] a screen went: {error:#}");
+                                        }
+                                    })
+                                    .ok();
+                            }
+                            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(ACCEPT_POLL);
+                            }
+                            Err(error) => {
+                                crate::log_line!("[mirror] could not accept a screen: {error}");
+                                std::thread::sleep(ACCEPT_POLL);
+                            }
+                        }
                     }
                 })
                 .context("could not start the mirror listener")?;
         }
 
-        Ok(Desk { inner, port })
+        Ok(Desk { inner, port, stopped })
+    }
+
+    /// Closes the port and disconnects every screen.
+    ///
+    /// Dropping the senders is what ends each screen's write loop, which closes
+    /// its socket, which is how the other machine finds out. Nothing is sent to
+    /// announce it: a message saying "goodbye" would be one more thing to get
+    /// wrong, and a closed socket is unambiguous.
+    pub fn stop(&self) {
+        self.stopped.store(true, Ordering::Relaxed);
+        self.inner.lock().unwrap().screens.clear();
     }
 
     pub fn port(&self) -> u16 {
@@ -227,6 +273,12 @@ impl Desk {
     pub fn beat(&self) {
         let mut inner = self.inner.lock().unwrap();
         inner.screens.retain(|screen| screen.send(Message::Beat).is_ok());
+    }
+}
+
+impl Drop for Desk {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -278,6 +330,16 @@ fn serve_one(stream: TcpStream, inner: Arc<Mutex<Inner>>) -> Result<()> {
     Ok(())
 }
 
+/// How long to wait before the first retry, and how far the wait may grow.
+///
+/// The ceiling is low on purpose. This is a live service: a church wifi blip
+/// lasting seconds should cost seconds, and a backoff that has climbed to a
+/// minute means the verse the preacher is on now arrives after he has finished
+/// with it. The cost of trying often is a TCP connection to a machine in the
+/// same room.
+const RETRY_FIRST: Duration = Duration::from_secs(1);
+const RETRY_LONGEST: Duration = Duration::from_secs(8);
+
 /// The screen: connects, proves itself, and reports what arrives.
 ///
 /// # What it does not do when the link drops
@@ -286,6 +348,11 @@ fn serve_one(stream: TcpStream, inner: Arc<Mutex<Inner>>) -> Result<()> {
 /// seconds behind — clearing is something an operator does on purpose, and a
 /// network blip is not that. The last verse stays on screen and the caller is
 /// told the link went, so it can say so somewhere that is not the stream.
+///
+/// This is a property of the *protocol*, not only of the drawing code: nothing
+/// in a dropped connection produces a [`Shown::Nothing`]. A blank arrives only
+/// when the desk deliberately staged one, so a screen cannot be cleared by a
+/// bad network — it can only be cleared by a person.
 pub struct Screen;
 
 impl Screen {
@@ -361,6 +428,80 @@ impl Screen {
                     return Ok(());
                 }
             }
+        }
+    }
+}
+
+impl Screen {
+    /// Stays connected for as long as `keep_going` says to, reconnecting when
+    /// the link fails.
+    ///
+    /// `find_desk` is asked for an address on every attempt rather than once, so
+    /// a desk that came back on a different address — a new DHCP lease after the
+    /// router restarted, which is a thing that happens to a church hall — is
+    /// found again without anybody touching either machine.
+    ///
+    /// Returns when `keep_going` goes false, or when the desk refuses. A refusal
+    /// is a decision rather than a fault: retrying into it would spin forever
+    /// against a desk that has already said no, and the operator needs to know
+    /// rather than wait.
+    pub fn keep_connected(
+        find_desk: impl Fn() -> Option<std::net::SocketAddr>,
+        id: &str,
+        name: &str,
+        token: &str,
+        keep_going: impl Fn() -> bool,
+        report: impl Fn(Event),
+    ) {
+        let mut wait = RETRY_FIRST;
+        // Set by the wrapper below when the desk refuses. `run` reports a
+        // refusal and returns Ok -- it is not an error, it is an answer -- so
+        // without this the loop would treat it as an ordinary disconnection and
+        // retry into a "no" for the rest of the service.
+        let refused = std::cell::Cell::new(false);
+
+        while keep_going() {
+            let attempt = match find_desk() {
+                Some(address) => Screen::run(
+                    address,
+                    id,
+                    name,
+                    &Secret::Token(token.to_string()),
+                    |event| {
+                        if matches!(event, Event::Rejected { .. }) {
+                            refused.set(true);
+                        }
+                        report(event);
+                    },
+                ),
+                None => Err(anyhow!("no desk could be found on this network")),
+            };
+
+            if refused.get() {
+                return;
+            }
+
+            // A successful `run` returns when the link ended, which is ordinary.
+            // An error is a connection that never opened.
+            if let Err(error) = attempt {
+                report(Event::Dropped { reason: error.to_string() });
+            }
+
+            if !keep_going() {
+                return;
+            }
+
+            report(Event::Reconnecting { seconds: wait.as_secs() });
+            // Slept in slices so stopping does not have to wait out a backoff.
+            let until = Instant::now() + wait;
+            while Instant::now() < until {
+                if !keep_going() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100).min(RETRY_FIRST));
+            }
+
+            wait = (wait * 2).min(RETRY_LONGEST);
         }
     }
 }
@@ -515,6 +656,116 @@ mod tests {
         // projector clears the overlay too.
         desk.stage(Shown::Nothing);
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing));
+    }
+
+    #[test]
+    fn a_dropped_link_never_produces_a_blank() {
+        /*
+         * The property the whole feature rests on, asserted against the
+         * protocol rather than against the drawing code.
+         *
+         * A screen going blank behind a preacher is the worst thing this can
+         * do -- worse than being a few seconds behind, worse than not
+         * connecting at all, because the operator sees an empty overlay and has
+         * no idea whether it is coming back. Clearing is something a person
+         * does on purpose.
+         *
+         * So: kill the desk mid-service and prove that what arrives is a
+         * Dropped and nothing else. No Staged(Nothing), from anywhere.
+         */
+        let desk = Desk::start("The Desk", Vec::new(), 0).expect("should listen");
+        let port = desk.port();
+        let code = desk.offer_code();
+        let (tx, rx) = std_channel();
+
+        std::thread::spawn(move || {
+            Screen::run(("127.0.0.1", port), "screen-1", "Stream", &Secret::Code(code), move |e| {
+                let _ = tx.send(e);
+            })
+        });
+
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Connected { .. }));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing));
+        desk.stage(psalm());
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(psalm()));
+
+        // The desk goes: machine asleep, cable out, wifi gone.
+        drop(desk);
+
+        let after = rx.recv_timeout(Duration::from_secs(5)).expect("should have noticed");
+        assert!(matches!(after, Event::Dropped { .. }), "got {after:?}");
+
+        // And nothing follows it that would wipe the screen.
+        while let Ok(event) = rx.recv_timeout(Duration::from_millis(300)) {
+            assert_ne!(
+                event,
+                Event::Staged(Shown::Nothing),
+                "a dropped link must never blank the overlay",
+            );
+        }
+    }
+
+    #[test]
+    fn a_refusal_stops_the_loop_rather_than_spinning_against_a_no() {
+        // A refusal is an answer, not a fault. `run` reports it and returns Ok,
+        // so a loop that only watched for errors would retry into "no" for the
+        // rest of the service and never tell anybody why.
+        let desk = Desk::start("The Desk", Vec::new(), 0).expect("should listen");
+        let address: std::net::SocketAddr = ([127, 0, 0, 1], desk.port()).into();
+        let (tx, rx) = std_channel();
+
+        let ran = std::thread::spawn(move || {
+            Screen::keep_connected(
+                || Some(address),
+                "stranger",
+                "Somebody's laptop",
+                "a-token-nobody-issued",
+                || true, // never asked to stop: only a refusal can end this
+                move |event| {
+                    let _ = tx.send(event);
+                },
+            );
+        });
+
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Event::Rejected { .. }
+        ));
+        ran.join().expect("the loop should have ended on its own");
+    }
+
+    #[test]
+    fn it_keeps_trying_while_the_desk_is_away() {
+        // A church hall router restarts. Nobody is at either machine.
+        let (tx, rx) = std_channel();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let stopper = Arc::clone(&stop);
+        let ran = std::thread::spawn(move || {
+            Screen::keep_connected(
+                // Nothing there yet, which is what a desk not started looks like.
+                || None,
+                "screen-1",
+                "Stream",
+                "a-token",
+                move || !stopper.load(std::sync::atomic::Ordering::Relaxed),
+                move |event| {
+                    let _ = tx.send(event);
+                },
+            );
+        });
+
+        // It reports the failure and says when it will try again, rather than
+        // going quiet -- the operator needs somewhere to see why the overlay
+        // has stopped changing.
+        assert!(matches!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Dropped { .. }));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(3)).unwrap(),
+            Event::Reconnecting { .. }
+        ));
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        ran.join().expect("should stop when asked");
     }
 
     #[test]
