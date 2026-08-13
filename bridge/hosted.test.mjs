@@ -475,6 +475,30 @@ describe("a hosted session", () => {
     ok(calls.some((c) => c.path === "session/end"), "should have closed the session");
   });
 
+  it("never sends Deepgram a locale it refuses", async () => {
+    // en-NG is the one that caught us: Deepgram takes en-US and en-GB and
+    // rejects en-NG with a 400 at the handshake -- the locale a Nigerian
+    // church picks, in the country most of ours are in. Only "en" and "multi"
+    // are ever sent now, and both are verified against the live endpoint.
+    for (const locale of ["en-NG", "en-GB", "en-US", "en"]) {
+      const { server } = broker({
+        "session/start": () => ({
+          status: 200,
+          body: { sessionId: `sess-${locale}`, provider: "deepgram", token: "t", heartbeatSeconds: 60 },
+        }),
+        "session/end": () => ({ status: 200, body: {} }),
+      });
+      servers.push(server);
+      const run = start(stage(), await listen(server), { CASTAVOX_SPEECH_LANGUAGE: locale });
+
+      await until(() => run.stderr().includes("WS:"), `the socket for ${locale}`);
+      match(run.stderr(), /language=en&/, `${locale} should ask for plain en`);
+
+      run.child.kill("SIGTERM");
+      await run.exited;
+    }
+  });
+
   it("asks Deepgram for its multilingual model when the service is not in English", async () => {
     const { server } = broker({
       "session/start": () => ({

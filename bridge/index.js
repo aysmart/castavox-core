@@ -94,6 +94,16 @@ const REQUEST_TIMEOUT_MS = 15000;
 const SHUTDOWN_GRACE_MS = HOSTED ? 4000 : 1500;
 /** Two bytes a frame, mono: what a second of the audio we are sending weighs. */
 const BYTES_PER_SECOND = SAMPLE_RATE * 2;
+/**
+ * How long Deepgram may hear nothing from us before we say we are still here.
+ * It gives up at about ten seconds; this leaves room for a slow round trip.
+ */
+const KEEPALIVE_AFTER_MS = 3000;
+/**
+ * How long a stop waits for a handshake in progress, so that audio captured
+ * while connecting is flushed rather than dropped.
+ */
+const CONNECT_WAIT_MS = 1500;
 const AUDIO_FORMAT = sdk.AudioStreamFormat.getWaveFormatPCM(SAMPLE_RATE, 16, 1);
 
 /** Cancellation codes that retrying will never fix. */
@@ -343,14 +353,30 @@ async function closeSession() {
 /**
  * Deepgram's language parameter, from the locale the operator chose.
  *
- * Their English models take a BCP-47 tag and behave; everything else is asked
- * for as `multi`, nova-3's multilingual mode. Passing "yo-NG" straight through
- * would be rejected at the handshake, and a church that selected Yoruba would
- * meet a connection error rather than a transcript -- which is a worse answer
- * than a model that will at least try.
+ * Exactly two values are ever sent: `en` for an English locale and `multi` --
+ * nova-3's multilingual mode -- for anything else. Both are verified against
+ * the live endpoint.
+ *
+ * # Why the region is dropped rather than passed on
+ *
+ * This used to send any `en-*` tag through unchanged, on the reasonable-looking
+ * assumption that Deepgram takes BCP-47. It takes *some* of it. `en-US` and
+ * `en-GB` are accepted; **`en-NG` is refused with a 400 at the handshake** --
+ * which is the locale a Nigerian church picks, in the country most of our
+ * churches are in, so the failure landed precisely on the people it could hurt
+ * most and on nobody testing in English elsewhere.
+ *
+ * Nothing is lost by dropping it. nova-3 has one English model; the regional
+ * tags are aliases for it rather than accent-specific models, so `en-GB` and
+ * `en` transcribe a Nigerian speaker identically. What the narrower set buys is
+ * that no locale an operator can choose produces a request Deepgram rejects --
+ * and a rejected handshake is not a degraded transcript, it is no transcript.
+ *
+ * Azure still gets the full locale. It supports `en-NG` properly, and that path
+ * is unchanged.
  */
 function deepgramLanguage() {
-  return /^en(-|$)/i.test(LANGUAGE) ? LANGUAGE : "multi";
+  return /^en(-|$)/i.test(LANGUAGE) ? "en" : "multi";
 }
 
 /**
@@ -416,6 +442,32 @@ function buildDeepgram() {
     pendingBytes = 0;
   });
 
+  /*
+   * A word to Deepgram when the microphone has gone quiet on us.
+   *
+   * Not silence -- silence is audio and is streamed like any other. This is
+   * *no audio at all*, which is a stalled capture thread, a device unplugged,
+   * or a machine that slept. Deepgram closes such a connection after about ten
+   * seconds with a 1011, and it takes the utterance it had not yet finalised
+   * with it. Seen exactly that way in testing.
+   *
+   * So a KeepAlive goes out when nothing has been sent for a few seconds. It
+   * holds the connection without pretending there was sound: it is not audio,
+   * it is not billed as audio, and it does not affect what is transcribed.
+   */
+  let lastAudioAt = Date.now();
+  const keepAlive = setInterval(() => {
+    if (socket.readyState !== WebSocket.OPEN) return;
+    if (Date.now() - lastAudioAt < KEEPALIVE_AFTER_MS) return;
+    try {
+      socket.send(JSON.stringify({ type: "KeepAlive" }));
+    } catch {
+      /* the close handler deals with a socket that has gone */
+    }
+  }, KEEPALIVE_AFTER_MS);
+  keepAlive.unref?.();
+  socket.on("close", () => clearInterval(keepAlive));
+
   socket.on("message", (data) => {
     let payload;
     try {
@@ -449,16 +501,49 @@ function buildDeepgram() {
     });
   });
 
-  // A refused upgrade, which is what a bad or expired token looks like.
-  // Retrying cannot fix either, so it is reported rather than reconnected.
+  /*
+   * A refused upgrade: a bad token, or a query it will not accept.
+   *
+   * The body is read, and that is the whole point of this handler. It reported
+   * the status alone once -- "the speech service answered 400" -- which is true
+   * and tells nobody which of a dozen parameters it objected to. Deepgram says
+   * exactly which; throwing that away and reconnecting to be refused again in
+   * the same way is not a diagnosis, it is a loop.
+   *
+   * Bounded, and to stderr rather than into the operator's message: what a
+   * volunteer needs is one sentence, and `endpointing must be an integer` is
+   * not it.
+   */
   socket.on("unexpected-response", (_request, response) => {
-    const status = response && response.statusCode;
-    if (status === 401 || status === 403) {
-      fail(`Deepgram rejected the connection (${status}).`, true);
-      shutdown(1);
-      return;
-    }
-    scheduleRestart(`the speech service answered ${status || "an error"}`);
+    const status = (response && response.statusCode) || 0;
+    let body = "";
+    response.on("data", (chunk) => {
+      if (body.length < 500) body += chunk.toString();
+    });
+    response.on("end", () => {
+      const detail = body.trim().slice(0, 500);
+      if (detail) console.error(`[deepgram] ${status}: ${detail}`);
+
+      // A credential problem cannot be retried into working.
+      if (status === 401 || status === 403) {
+        fail(`Deepgram rejected the connection (${status}).`, true);
+        shutdown(1);
+        return;
+      }
+      // Nor can a request it will never accept. Reconnecting on a 400 is a
+      // loop that ends when the operator gives up, so it stops and says so.
+      if (status === 400) {
+        fail(
+          "Deepgram would not accept the connection. This is ours to fix, not " +
+            "yours — transcription on this machine still works.",
+          true,
+        );
+        shutdown(1);
+        return;
+      }
+      scheduleRestart(`the speech service answered ${status || "an error"}`);
+    });
+    response.resume();
   });
 
   socket.on("error", (err) => scheduleRestart(describe(err)));
@@ -476,6 +561,7 @@ function buildDeepgram() {
     write(chunk) {
       if (socket.readyState === WebSocket.OPEN) {
         socket.send(chunk);
+        lastAudioAt = Date.now();
         return true;
       }
       // Held until the handshake finishes. Counted as sent, because it will be.
@@ -487,23 +573,61 @@ function buildDeepgram() {
       return false;
     },
     stop() {
-      return new Promise((done) => {
-        if (socket.readyState !== WebSocket.OPEN) {
-          try {
-            socket.terminate();
-          } catch {
-            /* already gone */
-          }
-          return done();
-        }
-        // Asks for the last of the audio to be transcribed before the socket
-        // goes. Without it the closing seconds of a sermon are simply dropped.
+      // Asks for the last of the audio to be transcribed before the socket
+      // goes. Without it the closing seconds of a sermon are simply dropped.
+      const flush = (done) => {
         socket.once("close", done);
         try {
           socket.send(JSON.stringify({ type: "CloseStream" }));
         } catch {
           done();
         }
+      };
+
+      return new Promise((done) => {
+        if (socket.readyState === WebSocket.OPEN) return flush(done);
+
+        /*
+         * Still shaking hands. Wait for it, briefly.
+         *
+         * Everything captured so far is in `pending` and is sent the moment the
+         * socket opens, so giving up here throws all of it away -- which is
+         * what this did, and what a stop during a reconnection would have meant
+         * on bad hall wifi: the operator stops, and the last thing anybody said
+         * was never transcribed. Nothing announces that; it is simply missing.
+         *
+         * Short, because it runs inside the shutdown grace window and a
+         * handshake that has not finished by now will not rescue much.
+         */
+        if (socket.readyState === WebSocket.CONNECTING) {
+          const giveUp = setTimeout(() => {
+            try {
+              socket.terminate();
+            } catch {
+              /* already gone */
+            }
+            done();
+          }, CONNECT_WAIT_MS);
+          giveUp.unref?.();
+
+          const settle = () => {
+            clearTimeout(giveUp);
+            done();
+          };
+          socket.once("open", () => {
+            clearTimeout(giveUp);
+            flush(done);
+          });
+          socket.once("error", settle);
+          return;
+        }
+
+        try {
+          socket.terminate();
+        } catch {
+          /* already gone */
+        }
+        done();
       });
     },
     close() {
