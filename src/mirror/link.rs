@@ -40,7 +40,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use super::pairing::{new_nonce, prove, Answer, Challenge, Doorkeeper, Pairing, Verdict};
+use super::pairing::{
+    derive_token, new_nonce, prove, Answer, Challenge, Doorkeeper, Pairing, Verdict,
+};
 
 /// How often the desk writes something, so a vanished screen is noticed.
 pub const HEARTBEAT: Duration = Duration::from_secs(5);
@@ -110,6 +112,13 @@ pub enum Message {
 pub enum Event {
     /// Admitted, and by what name the desk knows itself.
     Connected { desk: String },
+    /// Paired, with the secret to keep for next time.
+    ///
+    /// Derived here rather than received: it never crosses the wire, so the
+    /// only way the screen can have it is to compute it, and the only moment it
+    /// has the ingredients is now. A caller that does not store this will pair
+    /// successfully today and be a stranger tomorrow.
+    Paired { peer_id: String, token: String },
     Staged(Shown),
     /// The link went. **What was last staged is deliberately not cleared** —
     /// see [`Screen::keep_connected`].
@@ -385,6 +394,10 @@ impl Screen {
 
         let challenge: Challenge = read_line(&mut reading)?;
 
+        // Computed before the answer goes out, from the same three ingredients
+        // the desk will use. Reported only if the desk agrees.
+        let mut derived = String::new();
+
         let answer = match secret {
             Secret::Code(code) => {
                 if !challenge.pairing_open {
@@ -393,6 +406,7 @@ impl Screen {
                     });
                     return Ok(());
                 }
+                derived = derive_token(code, id, &challenge.nonce);
                 Answer::Pair {
                     id: id.to_string(),
                     name: name.to_string(),
@@ -410,7 +424,17 @@ impl Screen {
             // The desk's name from the challenge, not the name the verdict
             // echoes back -- that one is us, and reporting it here told the
             // operator they had connected to their own machine.
-            Verdict::Ready { .. } => report(Event::Connected { desk: challenge.desk.clone() }),
+            Verdict::Ready { .. } => {
+                // Before Connected, so a caller storing it on this event has it
+                // safe before anything else can go wrong.
+                if !derived.is_empty() {
+                    report(Event::Paired {
+                        peer_id: id.to_string(),
+                        token: std::mem::take(&mut derived),
+                    });
+                }
+                report(Event::Connected { desk: challenge.desk.clone() });
+            }
             // Not retried. A refusal is a decision, not a fault, and reconnecting
             // into it would spin against a desk that has already said no.
             Verdict::Refused { reason } => {
@@ -520,6 +544,22 @@ mod tests {
     use crate::mirror::pairing::derive_token;
     use std::sync::mpsc::channel as std_channel;
 
+    /// The next event that is not the pairing handover.
+    ///
+    /// Three tests pair with a code and then want the connection, and `Paired`
+    /// arrives first by design -- the token has to be safe before anything else
+    /// can go wrong.
+    fn next_after_pairing(
+        rx: &std::sync::mpsc::Receiver<Event>,
+    ) -> Event {
+        loop {
+            let event = rx.recv_timeout(Duration::from_secs(3)).expect("should have answered");
+            if !matches!(event, Event::Paired { .. }) {
+                return event;
+            }
+        }
+    }
+
     fn psalm() -> Shown {
         Shown::Scripture {
             reference: "John 3:16".into(),
@@ -571,9 +611,11 @@ mod tests {
         let (token, seen) = pair(&desk);
 
         assert!(!token.is_empty(), "the desk should have remembered the pairing");
-        // The *desk's* name, not this screen's. Reporting the verdict's name
-        // here told the operator they had connected to their own machine.
-        assert_eq!(seen.first(), Some(&Event::Connected { desk: "The Desk".into() }));
+        // The token comes first, so it is safe before anything else can fail.
+        assert!(matches!(seen.first(), Some(Event::Paired { .. })));
+        // And the *desk's* name, not this screen's. Reporting the verdict's
+        // name here told the operator they had connected to their own machine.
+        assert!(seen.contains(&Event::Connected { desk: "The Desk".into() }));
         // Staged before this screen existed, and given to it on arrival: a
         // church starts Castavox after Pulpitry more often than not.
         assert_eq!(seen.last(), Some(&Event::Staged(psalm())));
@@ -605,7 +647,7 @@ mod tests {
             })
         });
 
-        let first = rx.recv_timeout(Duration::from_secs(3)).expect("should have connected");
+        let first = next_after_pairing(&rx);
         assert!(matches!(first, Event::Connected { .. }), "got {first:?}");
     }
 
@@ -646,7 +688,7 @@ mod tests {
         });
 
         // Connected, then the empty state it joined into.
-        assert!(matches!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Connected { .. }));
+        assert!(matches!(next_after_pairing(&rx), Event::Connected { .. }));
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing));
 
         desk.stage(psalm());
@@ -656,6 +698,34 @@ mod tests {
         // projector clears the overlay too.
         desk.stage(Shown::Nothing);
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing));
+    }
+
+    #[test]
+    fn the_screen_is_given_the_token_it_will_need_tomorrow() {
+        // It never crosses the wire, so the only way the screen can have it is
+        // to derive it, and the only moment it has the ingredients is during
+        // the handshake. A caller that is not handed it here pairs today and is
+        // a stranger next Sunday.
+        let desk = Desk::start("The Desk", Vec::new(), 0).expect("should listen");
+        let code = desk.offer_code();
+        let port = desk.port();
+        let (tx, rx) = std_channel();
+
+        std::thread::spawn(move || {
+            Screen::run(("127.0.0.1", port), "screen-1", "Stream", &Secret::Code(code), move |e| {
+                let _ = tx.send(e);
+            })
+        });
+
+        let first = rx.recv_timeout(Duration::from_secs(3)).expect("should have paired");
+        let Event::Paired { peer_id, token } = first else {
+            panic!("expected the token first, got {first:?}");
+        };
+        assert_eq!(peer_id, "screen-1");
+
+        // And it is the same one the desk kept, or the next connection fails.
+        assert_eq!(token, desk.pairings()[0].token);
+        assert!(!token.is_empty());
     }
 
     #[test]
@@ -684,7 +754,7 @@ mod tests {
             })
         });
 
-        assert!(matches!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Connected { .. }));
+        assert!(matches!(next_after_pairing(&rx), Event::Connected { .. }));
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing));
         desk.stage(psalm());
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(psalm()));
