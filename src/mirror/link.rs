@@ -118,7 +118,13 @@ pub enum Event {
     /// only way the screen can have it is to compute it, and the only moment it
     /// has the ingredients is now. A caller that does not store this will pair
     /// successfully today and be a stranger tomorrow.
-    Paired { peer_id: String, token: String },
+    ///
+    /// The token and nothing else. This carried a `peer_id` once, which was
+    /// *this* machine's — what the desk now knows us by — and a caller
+    /// reasonably read it as the desk's and stored it as the address to come
+    /// back to. The screen already knows which desk it just connected to; it
+    /// was the one thing it did know.
+    Paired { token: String },
     Staged(Shown),
     /// The link went. **What was last staged is deliberately not cleared** —
     /// see [`Screen::keep_connected`].
@@ -442,10 +448,7 @@ impl Screen {
                 // Before Connected, so a caller storing it on this event has it
                 // safe before anything else can go wrong.
                 if !derived.is_empty() {
-                    report(Event::Paired {
-                        peer_id: id.to_string(),
-                        token: std::mem::take(&mut derived),
-                    });
+                    report(Event::Paired { token: std::mem::take(&mut derived) });
                 }
                 report(Event::Connected { desk: challenge.desk.clone() });
             }
@@ -732,10 +735,9 @@ mod tests {
         });
 
         let first = rx.recv_timeout(Duration::from_secs(3)).expect("should have paired");
-        let Event::Paired { peer_id, token } = first else {
+        let Event::Paired { token } = first else {
             panic!("expected the token first, got {first:?}");
         };
-        assert_eq!(peer_id, "screen-1");
 
         // And it is the same one the desk kept, or the next connection fails.
         assert_eq!(token, desk.pairings()[0].token);
