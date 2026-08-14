@@ -49,6 +49,27 @@ pub enum Failure {
     Unexpected(String),
 }
 
+/// A request failure, with the chain reqwest hides behind one sentence.
+///
+/// `reqwest::Error` prints "error sending request for url (…)" and stops. The
+/// cause -- a refused connection, a TLS handshake, a resolver, a runtime that
+/// would not let a blocking client run -- is one level down and is the only
+/// part anybody can act on. Reporting the summary alone cost an afternoon: a
+/// machine where `curl` answered in two seconds, an application that could not
+/// send at all, and a log line that said neither why.
+fn because(error: &reqwest::Error) -> String {
+    let mut said = error.to_string();
+    let mut source = std::error::Error::source(error);
+    // Capped: a chain is usually two or three deep, and a log line is not a
+    // place to print an unbounded one.
+    for _ in 0..5 {
+        let Some(cause) = source else { break };
+        said.push_str(&format!(" — {cause}"));
+        source = cause.source();
+    }
+    said
+}
+
 impl std::fmt::Display for Failure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -235,7 +256,7 @@ fn send(
         .header("content-type", "application/json")
         .json(body)
         .send()
-        .map_err(|error| Failure::Unreachable(error.to_string()))?;
+        .map_err(|error| Failure::Unreachable(because(&error)))?;
 
     let status = response.status();
     let payload = response.text().unwrap_or_default();
