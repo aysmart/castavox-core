@@ -23,6 +23,7 @@ pub mod audio;
 pub mod embed;
 pub mod exports;
 pub mod hosted;
+pub mod languages;
 pub mod log;
 pub mod mirror;
 pub mod node;
