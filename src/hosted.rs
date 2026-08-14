@@ -232,8 +232,7 @@ impl Broker {
         // Before the client is built, not after. Installing the provider
         // afterwards leaves the client on whatever was already there, which
         // fails for every user rather than for none of them.
-        crate::tls::install();
-        reqwest::blocking::Client::builder()
+        crate::tls::client()
             .timeout(TIMEOUT)
             // Not followed, on purpose. Following one across hosts silently
             // drops the credential and returns a 401 that blames the licence;

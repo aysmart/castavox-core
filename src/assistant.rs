@@ -238,7 +238,6 @@ fn send(
     route: &Route<'_>,
     body: &serde_json::Value,
 ) -> Result<String> {
-    crate::tls::install();
 
     let request = match route {
         Route::Own { deployment, key } => client

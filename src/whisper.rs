@@ -131,10 +131,9 @@ pub fn catalogue(data_dir: &Path) -> Vec<ModelInfo> {
     // rustls has no provider unless one is installed, and this may be the
     // first thing in the process to make an HTTPS request -- the assistant
     // installs one too, but the operator may never have turned it on.
-    crate::tls::install();
     let mut found: Vec<ModelInfo> = Vec::new();
 
-    if let Ok(response) = reqwest::blocking::Client::builder()
+    if let Ok(response) = crate::tls::client()
         .timeout(Duration::from_secs(10))
         .build()
         .and_then(|client| client.get(CATALOGUE_URL).send())
@@ -417,7 +416,6 @@ pub fn download(data_dir: &Path, file: &str, progress: impl Fn(u64, u64)) -> Res
     // rustls has no provider unless one is installed, and this may be the
     // first thing in the process to make an HTTPS request -- the assistant
     // installs one too, but the operator may never have turned it on.
-    crate::tls::install();
     let target = model_path(data_dir, file);
     if is_installed(data_dir, file) {
         return Ok(target);
@@ -426,7 +424,7 @@ pub fn download(data_dir: &Path, file: &str, progress: impl Fn(u64, u64)) -> Res
         .context("could not make a place for the speech model")?;
 
     let name = target.file_name().and_then(|n| n.to_str()).unwrap_or(file);
-    let client = reqwest::blocking::Client::builder()
+    let client = crate::tls::client()
         .timeout(None)
         .build()
         .context("could not prepare the download")?;
