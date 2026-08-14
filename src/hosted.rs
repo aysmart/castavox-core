@@ -187,8 +187,30 @@ pub fn new_device_id() -> String {
 ///
 /// Here rather than in each product so that a church reading Castavox and
 /// Pulpitry side by side is not told two different things about one number.
+/// Above this, an allowance is a sentinel rather than a quantity. Five and a
+/// half years of continuous audio: no metered plan comes near it.
+const UNLIMITED_ABOVE: i64 = 50_000 * 3600;
+
 pub fn readable(seconds: i64) -> String {
     let seconds = seconds.max(0);
+
+    /*
+     * An unlimited plan reaches here as a number, and a number is not what it
+     * means.
+     *
+     * The broker stores "unlimited" as an allowance nothing can reach, which
+     * keeps the arithmetic honest at every comparison -- but it arrived in the
+     * settings dialog as "1000000 hr left this period", which is not a promise
+     * anybody made and reads as a fault. What the church bought is the word.
+     *
+     * The threshold is far above any real month: fifty thousand hours is five
+     * and a half years of continuous audio. Nothing metered will ever be
+     * mistaken for it.
+     */
+    if seconds >= UNLIMITED_ABOVE {
+        return "Unlimited".to_string();
+    }
+
     let hours = seconds / 3600;
     let minutes = (seconds % 3600) / 60;
     match (hours, minutes) {
@@ -386,6 +408,25 @@ impl IntoErr for Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unlimited_plan_says_so_rather_than_counting() {
+        // It reached a church's settings dialog as "1000000 hr left this
+        // period", which is not a promise anybody made and reads as a fault.
+        // What they bought is the word.
+        assert_eq!(super::readable(1_000_000 * 3600), "Unlimited");
+        assert_eq!(super::readable(3_599_999_014), "Unlimited");
+    }
+
+    #[test]
+    fn a_real_allowance_is_still_counted() {
+        // The threshold has to be far above any month anybody could use, or a
+        // metered plan starts claiming to be unlimited as it empties.
+        assert_eq!(super::readable(0), "none left");
+        assert_eq!(super::readable(1800), "30 min");
+        assert_eq!(super::readable(14 * 3600), "14 hr");
+        assert_eq!(super::readable(150 * 3600), "150 hr");
+    }
+
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
