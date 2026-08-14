@@ -82,8 +82,20 @@ sha2 = "0.10"
 # swallow the dependencies that follow it.
 whisper-rs = { version = "0.16", default-features = false }
 
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2", "blocking"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+
+# `rustls-no-provider`, not `rustls`, and the difference is not cosmetic.
+#
+# Plain `rustls` brings in rustls-platform-verifier, which turns on aws-lc-rs —
+# and Cargo unifies features across the whole tree, so this one word reached
+# into Pulpitry and undid the same choice made deliberately there. Two providers
+# were then compiled in while `tls::install` installed ring, and every HTTPS
+# request from that process failed with "error sending request for url" and no
+# cause: summaries and slides both, on a machine where curl worked.
+#
+# One provider, named here and installed by `tls::install`. It also keeps a C
+# toolchain off every machine that builds this, which was the original reason.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "http2", "blocking"] }
 
 [profile.release]
 # Size, except where speed is the product.
