@@ -20,6 +20,7 @@
 
 pub mod assistant;
 pub mod audio;
+pub mod checkin;
 pub mod embed;
 pub mod exports;
 pub mod hosted;
