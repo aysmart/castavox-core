@@ -412,6 +412,44 @@ pub fn smaller_than(file: &str) -> Option<String> {
     Some(named(LADDER[index.checked_sub(1)?], label.contains(".en")))
 }
 
+/// The next size up, for a machine that has proved it has room.
+///
+/// # Why this is measured and the first choice is not
+///
+/// [`recommended`] caps every machine that is not Apple silicon at `base`,
+/// whatever it advertises, because a thread count does not distinguish a
+/// workstation from a thin-and-light pretending to be one -- and being wrong
+/// upward there cost a church the whole feature. That caution is right for a
+/// first launch, when nothing is known.
+///
+/// It is the wrong answer for ever. The rule predates Vulkan shipping, and a
+/// machine that has been running comfortably for a service has told us
+/// something no core count could: [`Local::sustained`] is real speech, at real
+/// lengths, on this hardware. So the ceiling is raised by evidence rather than
+/// by guessing harder about the guess.
+///
+/// Returns none at the top of the ladder, or for a model that is not on it --
+/// somebody running `large-v3-turbo` chose it deliberately.
+pub fn larger_than(file: &str) -> Option<String> {
+    let label = file.trim_start_matches("ggml-").trim_end_matches(".bin");
+    let size = label.split('.').next().unwrap_or_default();
+    let index = LADDER.iter().position(|rung| *rung == size)?;
+    // `medium` is on the ladder to be stepped *down* from and has never been an
+    // automatic choice; offering it is not the same as choosing it, and the
+    // operator still presses the button.
+    Some(named(*LADDER.get(index + 1)?, label.contains(".en")))
+}
+
+/// Sustained cost at which a machine plainly has room for the next model up.
+///
+/// Seconds of work per second of audio. 0.15 is nearly seven times faster than
+/// speech, sustained, on real utterances -- and each rung of the ladder costs
+/// roughly two to three times the one below it, so a machine at this figure has
+/// the headroom for one step with margin left over. Deliberately far below the
+/// 0.35 that merely reads as "comfortable": a step up that has to be undone
+/// mid-service is worse than never offering it.
+pub const ROOM_TO_SPARE: f32 = 0.15;
+
 /// Whether the `.en` builds are the right family for this locale. They are
 /// better at English and cannot do anything else.
 fn english(locale: &str) -> bool {
@@ -792,6 +830,9 @@ impl Local {
         let mut floor = f32::MAX;
         let mut silence = Duration::ZERO;
         let mut spoke = false;
+        // The last sustained figure said out loud, so a steady machine does not
+        // narrate itself between every sentence.
+        let mut reported_sustained: Option<f32> = None;
         let mut last_interim = Instant::now();
         // How many settled utterances the decoder still owes us, and whether we
         // have already said something about it.
@@ -898,6 +939,31 @@ impl Local {
                         )),
                     }
                 }
+                /*
+                 * What this machine is actually doing, said once when it is
+                 * first known and then only when it changes materially.
+                 *
+                 * The plan's first instruction for this was to instrument a
+                 * real session and find where it diverges, and this is that
+                 * line: real speech, at the lengths the preacher actually
+                 * speaks in, on their hardware. It is the number the settings
+                 * dialog should eventually show instead of a benchmark, and
+                 * until it does, it is the number to ask an operator for when
+                 * they report falling behind.
+                 */
+                if let Some(factor) = self.sustained() {
+                    let moved = reported_sustained.is_none_or(|last: f32| {
+                        (factor - last).abs() > (last * 0.2).max(0.02)
+                    });
+                    if moved {
+                        reported_sustained = Some(factor);
+                        note(format!(
+                            "This machine is sustaining {:.1}x real time on real speech.",
+                            if factor > 0.0 { 1.0 / factor } else { 0.0 }
+                        ));
+                    }
+                }
+
                 silence = Duration::ZERO;
                 spoke = false;
                 last_interim = Instant::now();
@@ -1196,6 +1262,14 @@ mod tests {
         // Already the smallest there is: there is no advice left to give, and
         // inventing some would send the operator looking for a file.
         assert_eq!(smaller_than("ggml-tiny.en.bin"), None);
+
+        // And back up the same rungs, for a machine that has earned it.
+        assert_eq!(larger_than("ggml-tiny.en.bin").as_deref(), Some("ggml-base.en.bin"));
+        assert_eq!(larger_than("ggml-base.en.bin").as_deref(), Some("ggml-small.en.bin"));
+        assert_eq!(larger_than("ggml-small.bin").as_deref(), Some("ggml-medium.bin"));
+        // The top of the ladder, and anything chosen by hand from outside it.
+        assert_eq!(larger_than("ggml-medium.en.bin"), None);
+        assert_eq!(larger_than("ggml-large-v3-turbo.bin"), None);
         // Chosen deliberately and off the ladder. Guessing what somebody
         // running large-v3-turbo meant is not our business.
         assert_eq!(smaller_than("ggml-large-v3-turbo.bin"), None);
