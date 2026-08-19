@@ -27,14 +27,18 @@ fn main() {
     // Staged late on purpose: a screen that pairs first has to receive a
     // *change*, not only the state it joined into.
     std::thread::sleep(std::time::Duration::from_secs(20));
-    desk.stage(castavox_core::mirror::Shown::Scripture {
-        reference: "John 3:16".into(),
-        translation: "KJV".into(),
-        lines: vec![castavox_core::mirror::Line {
-            number: 16,
-            text: "For God so loved the world, that he gave his only begotten Son.".into(),
-        }],
-    });
+    desk.stage(
+        castavox_core::mirror::Shown::Scripture {
+            reference: "John 3:16".into(),
+            translation: "KJV".into(),
+            lines: vec![castavox_core::mirror::Line {
+                number: 16,
+                text: "For God so loved the world, that he gave his only begotten Son.".into(),
+            }],
+        },
+        // From the top: a single verse fits any screen worth mirroring to.
+        0.0,
+    );
     println!("STAGED");
 
     // Without this the screen's read times out and a quiet service looks like

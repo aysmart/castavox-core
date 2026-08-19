@@ -98,17 +98,51 @@ impl Shown {
 }
 
 /// Everything the desk sends once a connection is admitted.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Eq` is gone from this and from [`Event`] because the wind position is a
+/// fraction, and a float has no total ordering. Nothing compares these for
+/// exact equality outside the tests, which compare literals.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Message {
     /// What is staged now. Sent on connection and on every change.
-    Staged { shown: Shown },
+    Staged {
+        shown: Shown,
+        /// How far through a body taller than the screen the desk has wound,
+        /// from 0.0 at the top to 1.0 at the end.
+        ///
+        /// Beside `shown` rather than inside it, because it is not part of what
+        /// the desk is saying -- it is which part of it is being said. A screen
+        /// that draws the whole thing at once ignores it and loses nothing.
+        ///
+        /// # Why a fraction and not a frame number
+        ///
+        /// This was a count of screenfuls, and it did not survive contact with
+        /// two screens. The desk broke one lexicon entry into four frames and
+        /// the paired overlay broke the same entry into two, because they have
+        /// different shapes, different type sizes and different amounts of room
+        /// -- so "frame 3" was a place that existed on one of them and not the
+        /// other. Winding to the third frame moved the desk and did nothing at
+        /// all on the screen.
+        ///
+        /// A fraction is the one thing both ends can agree on without knowing
+        /// anything about each other's layout. It is exact where it matters
+        /// most -- 0.0 is the first line on both, 1.0 is the last on both --
+        /// and proportional in between, which is the best that is available
+        /// when one surface genuinely shows more text than the other.
+        ///
+        /// Defaulted, so a desk that has been updated can still talk to a
+        /// screen that has not, and the other way round. Both then behave as
+        /// they did before this existed: the text arrives from the top.
+        #[serde(default)]
+        progress: f32,
+    },
     /// Proof the desk is still there. Carries nothing.
     Beat,
 }
 
 /// What a screen reports to whatever is drawing.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     /// Admitted, and by what name the desk knows itself.
     Connected { desk: String },
@@ -125,7 +159,7 @@ pub enum Event {
     /// back to. The screen already knows which desk it just connected to; it
     /// was the one thing it did know.
     Paired { token: String },
-    Staged(Shown),
+    Staged(Shown, f32),
     /// The link went. **What was last staged is deliberately not cleared** —
     /// see [`Screen::keep_connected`].
     Dropped { reason: String },
@@ -183,6 +217,9 @@ pub struct Desk {
 struct Inner {
     door: Doorkeeper,
     staged: Shown,
+    /// How far through what it staged the desk has wound, so a screen that
+    /// joins mid-reading arrives at the same place as the others.
+    progress: f32,
     /// One sender per admitted screen. A send that fails is a screen that has
     /// gone, and it is dropped here rather than anywhere else.
     screens: Vec<Sender<Message>>,
@@ -204,6 +241,7 @@ impl Desk {
         let inner = Arc::new(Mutex::new(Inner {
             door: Doorkeeper::new(known),
             staged: Shown::Nothing,
+            progress: 0.0,
             screens: Vec::new(),
             name: name.to_string(),
         }));
@@ -291,10 +329,11 @@ impl Desk {
     ///
     /// Also remembered, so a screen connecting afterwards is given it at once
     /// rather than waiting for the next verse.
-    pub fn stage(&self, shown: Shown) {
+    pub fn stage(&self, shown: Shown, progress: f32) {
         let mut inner = self.inner.lock().unwrap();
         inner.staged = shown.clone();
-        let message = Message::Staged { shown };
+        inner.progress = progress;
+        let message = Message::Staged { shown, progress };
         inner.screens.retain(|screen| screen.send(message.clone()).is_ok());
     }
 
@@ -346,9 +385,10 @@ fn serve_one(stream: TcpStream, inner: Arc<Mutex<Inner>>) -> Result<()> {
         // Whatever is staged, before anything else: a screen that joined
         // mid-passage should show the passage, not wait for the next one.
         let staged = inner.staged.clone();
+        let progress = inner.progress;
         inner.screens.push(tx);
         drop(inner);
-        write_line(&mut writing, &Message::Staged { shown: staged })?;
+        write_line(&mut writing, &Message::Staged { shown: staged, progress })?;
     }
 
     // Ends when the desk drops the sender, or when a write fails because the
@@ -462,7 +502,7 @@ impl Screen {
 
         loop {
             match read_line::<Message>(&mut reading) {
-                Ok(Message::Staged { shown }) => report(Event::Staged(shown)),
+                Ok(Message::Staged { shown, progress }) => report(Event::Staged(shown, progress)),
                 Ok(Message::Beat) => {}
                 Err(error) => {
                     report(Event::Dropped { reason: error.to_string() });
@@ -606,7 +646,7 @@ mod tests {
         // Enough to admit and deliver the first push.
         let mut seen = Vec::new();
         while let Ok(event) = rx.recv_timeout(Duration::from_secs(3)) {
-            let last = matches!(event, Event::Staged(_));
+            let last = matches!(event, Event::Staged(..));
             seen.push(event);
             if last {
                 break;
@@ -623,7 +663,7 @@ mod tests {
     #[test]
     fn a_screen_pairs_and_is_told_what_is_staged() {
         let desk = Desk::start("The Desk", Vec::new(), 0).expect("should listen");
-        desk.stage(psalm());
+        desk.stage(psalm(), 0.0);
 
         let (token, seen) = pair(&desk);
 
@@ -635,16 +675,16 @@ mod tests {
         assert!(seen.contains(&Event::Connected { desk: "The Desk".into() }));
         // Staged before this screen existed, and given to it on arrival: a
         // church starts Castavox after Pulpitry more often than not.
-        assert_eq!(seen.last(), Some(&Event::Staged(psalm())));
+        assert_eq!(seen.last(), Some(&Event::Staged(psalm(), 0.0)));
     }
 
     #[test]
     fn what_is_already_staged_arrives_before_anything_changes() {
         let desk = Desk::start("The Desk", Vec::new(), 0).expect("should listen");
-        desk.stage(psalm());
+        desk.stage(psalm(), 0.0);
         let (_, seen) = pair(&desk);
 
-        let staged: Vec<&Event> = seen.iter().filter(|e| matches!(e, Event::Staged(_))).collect();
+        let staged: Vec<&Event> = seen.iter().filter(|e| matches!(e, Event::Staged(..))).collect();
         assert_eq!(staged.len(), 1, "exactly one push, without the desk staging again");
     }
 
@@ -706,15 +746,15 @@ mod tests {
 
         // Connected, then the empty state it joined into.
         assert!(matches!(next_after_pairing(&rx), Event::Connected { .. }));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing, 0.0));
 
-        desk.stage(psalm());
-        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(psalm()));
+        desk.stage(psalm(), 0.0);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(psalm(), 0.0));
 
         // And a clear is a message like any other, so an operator clearing the
         // projector clears the overlay too.
-        desk.stage(Shown::Nothing);
-        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing));
+        desk.stage(Shown::Nothing, 0.0);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing, 0.0));
     }
 
     #[test]
@@ -771,9 +811,9 @@ mod tests {
         });
 
         assert!(matches!(next_after_pairing(&rx), Event::Connected { .. }));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing));
-        desk.stage(psalm());
-        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(psalm()));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing, 0.0));
+        desk.stage(psalm(), 0.0);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(psalm(), 0.0));
 
         // The desk goes: machine asleep, cable out, wifi gone.
         drop(desk);
@@ -785,7 +825,7 @@ mod tests {
         while let Ok(event) = rx.recv_timeout(Duration::from_millis(300)) {
             assert_ne!(
                 event,
-                Event::Staged(Shown::Nothing),
+                Event::Staged(Shown::Nothing, 0.0),
                 "a dropped link must never blank the overlay",
             );
         }
