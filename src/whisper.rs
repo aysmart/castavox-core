@@ -210,25 +210,37 @@ fn interim_pace(last_decode_ms: usize) -> Duration {
 /// stepped down from, never as an automatic choice.
 const LADDER: [&str; 4] = ["tiny", "base", "small", "medium"];
 
-/// How fast this machine decodes, measured rather than guessed.
+/// What one decode costs this machine, in seconds of work per window.
 ///
-/// Returns the real-time factor: seconds of processor time per second of audio.
-/// Below 1.0 means it decodes faster than speech arrives, which is the whole
-/// question. Around 0.3 is comfortable; past 0.7 a service will fall behind,
-/// because a real one is also capturing, detecting and drawing.
+/// # What this is, and what it is not
 ///
-/// # Why this exists at all
+/// It is the cost of putting one utterance through the model, whatever length
+/// that utterance is. It is **not** a real-time factor, and the version that
+/// claimed to be one was wrong in two ways that both flattered the machine.
 ///
-/// Everything else in this module that judges a machine is a guess from its
-/// core count, and the guesses have been wrong in both directions -- a
-/// thin-and-light advertising sixteen threads was handed a model it could not
-/// carry, and an Apple laptop was told it might struggle when it decodes
-/// twenty-five times faster than real time. A number settles it in four
-/// seconds.
+/// It decoded five seconds of digital silence and divided the time by five. But
+/// whisper pads whatever it is handed up to a thirty-second window and encodes
+/// the whole window, so the work does not vary with the length of the clip --
+/// only the divisor does. Measured on an Apple laptop against `base.en`, one
+/// window costs about 0.07 s and the same machine reported 16x, 68x, 224x or
+/// 422x real time purely according to whether it was handed one second, five,
+/// fifteen or twenty-nine. The published figure was a property of the number 5.
 ///
-/// The audio is synthetic, and that is sound: whisper pads every window to
-/// thirty seconds internally, so the cost of a decode is set by the model and
-/// the window rather than by what was said. Silence times the same as a sermon.
+/// And silence is the cheapest thing there is: whisper short-circuits when it
+/// hears no speech, so the decoder -- which runs once per token it produces --
+/// never runs at all. Real speech through the same window cost 2.5x as much on
+/// that machine, and the gap widens on a processor with no GPU behind it.
+///
+/// Together those are enough for a machine to measure thirty times faster than
+/// speech and still fall behind a preacher, which is exactly what one did.
+///
+/// # So what should be trusted instead
+///
+/// [`Local::sustained`], once a session has run for a minute: real speech, at
+/// the lengths people really speak in, on this machine. This function remains
+/// for the one thing it can honestly answer -- roughly what a single utterance
+/// costs, before anybody has spoken, which is enough to warn that a model is far
+/// too large for the machine it has been put on.
 pub fn measure(data_dir: &Path, file: &str) -> Result<f32> {
     if !is_installed(data_dir, file) {
         return Err(anyhow!("{file} is not downloaded"));
@@ -237,16 +249,39 @@ pub fn measure(data_dir: &Path, file: &str) -> Result<f32> {
     let engine = Local::new(data_dir.to_path_buf(), file.to_string());
     engine.ensure(&|_| {})?;
 
-    let seconds = 5.0f32;
-    let samples = vec![0.0f32; (TARGET_SAMPLE_RATE as f32 * seconds) as usize];
+    // A full window, because that is what every decode costs regardless.
+    // Anything shorter measures the same work and invites dividing by a
+    // smaller number, which is the mistake this replaces.
+    let samples = vec![0.0f32; (TARGET_SAMPLE_RATE as f32 * WINDOW_SECONDS) as usize];
 
     // The first decode loads and warms; the second is the one worth timing.
     let _ = engine.transcribe(&samples);
     let began = Instant::now();
     engine.transcribe(&samples)?;
 
-    Ok(began.elapsed().as_secs_f32() / seconds)
+    /*
+     * Reported against a window an utterance-sized fraction of which is
+     * typical, not against thirty seconds.
+     *
+     * A church's utterances are a few seconds each and each one costs a whole
+     * window, so dividing by thirty would understate the load by the same
+     * factor the old code overstated it. `TYPICAL_UTTERANCE` is what a settled
+     * stretch of preaching actually runs to, and it is the honest divisor until
+     * `sustained` has real speech to replace all of this with.
+     */
+    Ok(began.elapsed().as_secs_f32() / TYPICAL_UTTERANCE)
 }
+
+/// The window whisper pads every decode to. Not configurable; it is the shape
+/// of the model.
+const WINDOW_SECONDS: f32 = 30.0;
+
+/// How long a settled stretch of preaching tends to run.
+///
+/// A guess, and marked as one -- it is only the divisor for the cold estimate
+/// above, and [`Local::sustained`] replaces it with the truth as soon as
+/// anybody speaks.
+const TYPICAL_UTTERANCE: f32 = 6.0;
 
 /// What a measured real-time factor means for a service, in a sentence.
 pub fn describe_speed(factor: f32) -> String {
@@ -528,6 +563,36 @@ pub struct Local {
     /// changing it in settings takes effect without restarting a session.
     language: Mutex<String>,
     loaded: Mutex<Option<Loaded>>,
+    /// What this machine has actually done, from settled decodes of real
+    /// speech. See [`Local::sustained`].
+    sustained: Sustained,
+}
+
+/// A running record of real decodes, in milliseconds of work and of audio.
+///
+/// # Why a benchmark could not answer this
+///
+/// [`measure`] times one decode of one clip, and that turns out to say almost
+/// nothing. whisper pads whatever it is given up to a thirty-second window and
+/// encodes the whole thing, so the *work* is the same whether the clip is one
+/// second or twenty-nine -- only the divisor changes. Measured on an Apple
+/// laptop against `base.en`, one window costs about 0.07 s and the same machine
+/// reports 16x, 68x, 224x or 422x real time depending only on how long a clip
+/// somebody chose to hand it. Ours hands it five seconds and prints 68x.
+///
+/// It also decodes silence, which whisper short-circuits: real speech through
+/// the same window cost 2.5x as much on that machine, and the gap is wider on a
+/// processor with no GPU to fall back on, because the decoder runs once per
+/// token produced and silence produces none.
+///
+/// Both errors point the same way, which is why a machine can measure 30x and
+/// still fall behind a preacher. So the honest number is not a benchmark at
+/// all: it is what this machine did to the last few minutes of somebody's
+/// actual speech, at whatever lengths their utterances actually were.
+#[derive(Debug, Default)]
+struct Sustained {
+    work_ms: AtomicUsize,
+    audio_ms: AtomicUsize,
 }
 
 impl Local {
@@ -539,6 +604,7 @@ impl Local {
             .unwrap_or(4) as i32;
 
         Self {
+            sustained: Sustained::default(),
             data_dir,
             threads,
             wanted: Mutex::new(model_file),
@@ -614,6 +680,33 @@ impl Local {
     /// Public only so `examples/bench.rs` can measure this machine rather than
     /// anybody guessing at it. Loads the model on the first call, as a session
     /// does.
+    /// What this machine has actually been doing, or `None` before it has done
+    /// enough to say.
+    ///
+    /// Seconds of work per second of audio, over settled decodes of real
+    /// speech at the lengths people really speak in -- which is the number
+    /// [`measure`] cannot produce and the one that decides whether a service
+    /// keeps up. Below 1.0 is faster than speech.
+    ///
+    /// `None` until a minute of audio has gone through, because the first few
+    /// utterances of a session include a cold model and a cold cache and would
+    /// libel the machine.
+    pub fn sustained(&self) -> Option<f32> {
+        let audio_ms = self.sustained.audio_ms.load(Ordering::Relaxed);
+        if audio_ms < 60_000 {
+            return None;
+        }
+        let work_ms = self.sustained.work_ms.load(Ordering::Relaxed);
+        Some(work_ms as f32 / audio_ms as f32)
+    }
+
+    /// Records one settled decode against the running total.
+    fn record(&self, work: Duration, samples: usize) {
+        let audio_ms = samples * 1000 / TARGET_SAMPLE_RATE as usize;
+        self.sustained.work_ms.fetch_add(work.as_millis() as usize, Ordering::Relaxed);
+        self.sustained.audio_ms.fetch_add(audio_ms, Ordering::Relaxed);
+    }
+
     pub fn transcribe_for_bench(&self, samples: &[f32]) -> Result<String> {
         self.ensure(&|_| {})?;
         self.transcribe(samples)
@@ -913,6 +1006,14 @@ impl Local {
                     let began = Instant::now();
                     let spoken = engine.transcribe(audio);
                     working.store(false, Ordering::Relaxed);
+
+                    // Only the settled ones, and only when they produced text.
+                    // An interim covers a stretch that will be decoded again,
+                    // so counting both would charge this machine twice for the
+                    // same seconds of a sermon.
+                    if matches!(job, Job::Settled(_)) && spoken.as_deref().is_ok_and(|t| !t.trim().is_empty()) {
+                        engine.record(began.elapsed(), audio.len());
+                    }
 
                     // Only the partials. A settled decode covers the whole
                     // utterance and so takes longer than any interim of it
