@@ -833,6 +833,8 @@ impl Local {
         // The last sustained figure said out loud, so a steady machine does not
         // narrate itself between every sentence.
         let mut reported_sustained: Option<f32> = None;
+        // Once per session. An offer repeated between sentences is nagging.
+        let mut offered_larger = false;
         let mut last_interim = Instant::now();
         // How many settled utterances the decoder still owes us, and whether we
         // have already said something about it.
@@ -961,6 +963,34 @@ impl Local {
                             "This machine is sustaining {:.1}x real time on real speech.",
                             if factor > 0.0 { 1.0 / factor } else { 0.0 }
                         ));
+                    }
+
+                    /*
+                     * A machine with room to spare, told once.
+                     *
+                     * The mirror of the step-down above, and the only honest
+                     * way to raise a ceiling that is otherwise a guess from the
+                     * core count. `recommended` caps everything that is not
+                     * Apple silicon at `base` because a thread count cannot
+                     * tell a workstation from a thin-and-light -- but a machine
+                     * that has just run a service on real speech has answered
+                     * that question itself.
+                     *
+                     * Said, not done. Stepping down is a rescue and happens
+                     * without asking; stepping up is an improvement, costs a
+                     * download, and belongs to the operator. It is also said
+                     * exactly once per session: an offer repeated between
+                     * sentences is nagging.
+                     */
+                    if !offered_larger && factor <= ROOM_TO_SPARE {
+                        offered_larger = true;
+                        if let Some(larger) = self.loaded_model().as_deref().and_then(larger_than) {
+                            note(format!(
+                                "This machine has room to spare. {larger} would be more accurate \
+                                 and it can carry it -- fetch it under Settings before the next \
+                                 service."
+                            ));
+                        }
                     }
                 }
 
