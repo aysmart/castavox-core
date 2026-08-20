@@ -178,13 +178,31 @@ pub fn send(enabled: bool, endpoint: &str, data_dir: &Path, app: &str, version: 
     std::thread::Builder::new()
         .name("castavox-check-in".into())
         .spawn(move || {
-            let Ok(client) = reqwest::blocking::Client::builder().timeout(TIMEOUT).build() else {
-                return;
-            };
-            let sent = client.post(&endpoint).json(&body).send();
+            /*
+             * Caught, not merely handled.
+             *
+             * Everything below is best-effort and the whole feature is a
+             * courtesy, so nothing here may take a process down. It very nearly
+             * did: reqwest is built with `rustls-no-provider` and building a
+             * client before a provider is installed does not fail, it *panics*
+             * -- and on the first launch with the switch on, that panic reached
+             * the event loop thread and killed the window. A church would have
+             * discovered that by agreeing to help us.
+             *
+             * `tls::client` below is the fix for that particular cause and the
+             * module exists precisely so nobody has to remember it. This catch
+             * is for the next cause, whatever it is.
+             */
+            let attempt = std::panic::catch_unwind(|| {
+                let client = crate::tls::client().timeout(TIMEOUT).build().ok()?;
+                let sent = client.post(&endpoint).json(&body).send().ok()?;
+                sent.status().is_success().then_some(())
+            });
+
             // Stamped only on success, so a fortnight offline does not read as a
-            // fortnight of check-ins that never happened.
-            if sent.is_ok_and(|r| r.status().is_success()) {
+            // fortnight of check-ins that never happened -- and a panic is not a
+            // success however loudly it announces itself.
+            if matches!(attempt, Ok(Some(()))) {
                 let now =
                     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                 let _ = std::fs::write(stamp_path(&data_dir), now.to_string());
