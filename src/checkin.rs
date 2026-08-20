@@ -33,11 +33,18 @@
 //! filename, no audio. There is no field for one and no code path that could
 //! put one here.
 //!
-//! # It never blocks anything
+//! # It never blocks anything, and never reaches anything
 //!
-//! Sent on a background thread with a short timeout, and every failure is
-//! silent. A church with no network, a blocked domain or a broker having a bad
-//! morning must open the app and run a service exactly as they would otherwise.
+//! The caller's thread checks one boolean and spawns. Every other cost --
+//! reading whether a check-in is due, reading or making the install id, the
+//! request itself -- happens on the spawned thread, because a "small file
+//! read" on a roaming profile or behind an antivirus scanner is where an
+//! application stops for four seconds on launch.
+//!
+//! Every failure is silent: no network, a blocked domain, a broker having a bad
+//! morning, a read-only disk. And the thread catches its own panics, so the
+//! worst case is a check-in that did not happen rather than a `PANIC` line in
+//! the operator's log that makes a working application look broken.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -158,51 +165,80 @@ fn due(data_dir: &Path) -> bool {
 /// `enabled` is the operator's switch, and a false here does nothing at all: no
 /// file is written, no thread is spawned, no request is made.
 pub fn send(enabled: bool, endpoint: &str, data_dir: &Path, app: &str, version: &str, engine: &str) {
-    if !enabled || !due(data_dir) {
+    // The one thing decided on the caller's thread, because it decides whether
+    // to have a thread at all.
+    if !enabled {
         return;
     }
 
-    let body = CheckIn {
-        install: install_id(data_dir),
-        app: app.to_string(),
-        version: version.to_string(),
-        os: std::env::consts::OS.to_string(),
-        os_version: os_version(),
-        arch: std::env::consts::ARCH.to_string(),
-        cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
-        engine: engine.to_string(),
-    };
-
     let endpoint = endpoint.to_string();
     let data_dir = data_dir.to_path_buf();
+    let app = app.to_string();
+    let version = version.to_string();
+    let engine = engine.to_string();
+
+    /*
+     * Everything else happens over there, including the parts that look free.
+     *
+     * Reading whether a check-in is due and reading the install id are two
+     * small file operations, and on the machine in front of you they cost
+     * nothing. On a church laptop with a roaming profile, a home directory on a
+     * failing drive, or an antivirus scanner between the process and the disk,
+     * a "small file operation" is where an application stops for four seconds
+     * on launch -- and the operator would be watching a splash screen wondering
+     * whether it had hung, because of a courtesy they agreed to.
+     *
+     * So the caller's thread checks a boolean and spawns. Nothing else.
+     */
     std::thread::Builder::new()
         .name("castavox-check-in".into())
         .spawn(move || {
             /*
-             * Caught, not merely handled.
+             * Nothing in here may reach the application, by any route.
              *
-             * Everything below is best-effort and the whole feature is a
-             * courtesy, so nothing here may take a process down. It very nearly
-             * did: reqwest is built with `rustls-no-provider` and building a
-             * client before a provider is installed does not fail, it *panics*
-             * -- and on the first launch with the switch on, that panic reached
-             * the event loop thread and killed the window. A church would have
-             * discovered that by agreeing to help us.
+             * A panic on a spawned thread ends that thread and not the process,
+             * which is most of the guarantee already. `catch_unwind` is for what
+             * the panic would otherwise leave behind: a poisoned mutex, a
+             * half-written stamp, and a `PANIC` line in the operator's log that
+             * makes a working application look broken to whoever reads it next.
              *
-             * `tls::client` below is the fix for that particular cause and the
-             * module exists precisely so nobody has to remember it. This catch
-             * is for the next cause, whatever it is.
+             * The cause it was written for was ours. reqwest is built here with
+             * `rustls-no-provider`, and building a client before a provider is
+             * installed does not fail -- it panics, twice, once on reqwest's own
+             * internal runtime thread where nothing of ours can catch it.
+             * `tls::client` is the fix for that and exists precisely so nobody
+             * has to remember it. This is for the next cause.
              */
-            let attempt = std::panic::catch_unwind(|| {
-                let client = crate::tls::client().timeout(TIMEOUT).build().ok()?;
-                let sent = client.post(&endpoint).json(&body).send().ok()?;
-                sent.status().is_success().then_some(())
+            let done = std::panic::catch_unwind(|| {
+                if !due(&data_dir) {
+                    return false;
+                }
+
+                let body = CheckIn {
+                    install: install_id(&data_dir),
+                    app,
+                    version,
+                    os: std::env::consts::OS.to_string(),
+                    os_version: os_version(),
+                    arch: std::env::consts::ARCH.to_string(),
+                    cores: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(0),
+                    engine,
+                };
+
+                let Ok(client) = crate::tls::client().timeout(TIMEOUT).build() else {
+                    return false;
+                };
+                client
+                    .post(&endpoint)
+                    .json(&body)
+                    .send()
+                    .is_ok_and(|reply| reply.status().is_success())
             });
 
-            // Stamped only on success, so a fortnight offline does not read as a
-            // fortnight of check-ins that never happened -- and a panic is not a
-            // success however loudly it announces itself.
-            if matches!(attempt, Ok(Some(()))) {
+            // Stamped only on a real success, so a fortnight offline does not
+            // read as a fortnight of check-ins that never happened -- and a
+            // panic is not a success however loudly it announces itself.
+            if matches!(done, Ok(true)) {
                 let now =
                     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
                 let _ = std::fs::write(stamp_path(&data_dir), now.to_string());
@@ -279,6 +315,39 @@ mod tests {
         // without being allowed to.
         assert!(!id_path(&dir).exists(), "no install id for an operator who said no");
         assert!(!stamp_path(&dir).exists(), "no record of a check-in that never happened");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_caller_is_not_kept_waiting() {
+        let dir = std::env::temp_dir().join(format!("checkin-wait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        // A port nothing is listening on, so the request fails or hangs -- the
+        // two things a church's firewall actually does to us.
+        let began = std::time::Instant::now();
+        send(true, "http://127.0.0.1:9/blackhole", &dir, "pulpitry", "0.4.0", "local");
+        let took = began.elapsed();
+
+        // Generous by three orders of magnitude, and still far below TIMEOUT:
+        // the point is that the caller did not wait on the network, not that
+        // spawning a thread is fast.
+        assert!(took < Duration::from_millis(250), "send blocked the caller for {took:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_failed_check_in_leaves_no_trace_of_success() {
+        let dir = std::env::temp_dir().join(format!("checkin-fail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        send(true, "http://127.0.0.1:9/blackhole", &dir, "pulpitry", "0.4.0", "local");
+        // Long enough for the attempt to have failed and returned.
+        std::thread::sleep(Duration::from_millis(600));
+
+        // Never stamped, so tomorrow's launch tries again rather than believing
+        // a fortnight offline was a fortnight of check-ins.
+        assert!(!stamp_path(&dir).exists(), "a failure must not read as a success");
         std::fs::remove_dir_all(&dir).ok();
     }
 
