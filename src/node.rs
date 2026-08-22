@@ -28,6 +28,40 @@ pub struct NodeRuntime {
     pub major: u32,
 }
 
+/// Arguments that make this runtime trust the machine's own certificates.
+///
+/// # The problem this exists for
+///
+/// Node ships its own list of certificate authorities and ignores the operating
+/// system's. Our Rust side reads the system store, so on a machine where an
+/// antivirus or a church firewall inspects encrypted traffic -- which is most
+/// Windows machines in a church -- activating a licence works and starting a
+/// session does not. Same network, same host, minutes apart. The operator is
+/// told to check their internet connection, which is the one thing that is not
+/// wrong.
+///
+/// `--use-system-ca` fixes it, and arrived in Node 22.15. Older runtimes reject
+/// unknown options outright and would not start at all, so it is offered only
+/// where it is understood -- and asked of the runtime rather than inferred from
+/// the version, because the flag also had to be enabled by a build flag for
+/// part of its life.
+pub fn system_ca_args(node: &NodeRuntime) -> Vec<String> {
+    if node.major < 22 {
+        return Vec::new();
+    }
+    let understood = std::process::Command::new(&node.path)
+        .args(["--use-system-ca", "-e", ""])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+
+    if understood {
+        vec!["--use-system-ca".to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
 /// What the settings screen shows, and why starting failed if it did.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
