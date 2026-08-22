@@ -30,4 +30,5 @@ pub mod mirror;
 pub mod node;
 pub mod tls;
 pub mod transcripts;
+pub mod update;
 pub mod whisper;
