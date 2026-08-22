@@ -78,6 +78,37 @@ const sdk = require("microsoft-cognitiveservices-speech-sdk");
 // the SDK that stops using it cannot take our other transport with it.
 const WebSocket = require("ws");
 
+/*
+ * The proxy, where a church's network requires one.
+ *
+ * Neither `fetch` nor `ws` reads the proxy Windows is configured with, and
+ * neither reads the registry it lives in. So on a filtered church or school
+ * network every browser works, a licence activates -- Rust reads the system
+ * setting -- and this alone reaches nothing, which looks from the desk like the
+ * software being broken on that machine only.
+ *
+ * The launcher finds the setting and passes it here. Absent, which is the case
+ * on almost every connection, nothing below changes: the default clients are
+ * used exactly as before.
+ */
+const PROXY = (process.env.HTTPS_PROXY || process.env.https_proxy || "").trim();
+
+let proxyDispatcher = null;
+let proxyAgent = null;
+if (PROXY) {
+  try {
+    const { ProxyAgent } = require("undici");
+    proxyDispatcher = new ProxyAgent(PROXY);
+    const { HttpsProxyAgent } = require("https-proxy-agent");
+    proxyAgent = new HttpsProxyAgent(PROXY);
+    console.error(`[proxy] routing through ${PROXY}`);
+  } catch (err) {
+    // Reported, not fatal: a bad proxy address should fail as a connection
+    // error naming the proxy, not as a bridge that will not start.
+    console.error(`[proxy] could not use ${PROXY}: ${err && err.message}`);
+  }
+}
+
 const KEY = process.env.CASTAVOX_SPEECH_KEY || "";
 const REGION = process.env.CASTAVOX_SPEECH_REGION || "";
 const LANGUAGE = process.env.CASTAVOX_SPEECH_LANGUAGE || "en-US";
@@ -188,6 +219,8 @@ async function broker(path, payload) {
       },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      // Undefined without a proxy, which is what fetch expects for "direct".
+      dispatcher: proxyDispatcher || undefined,
     });
     // A redirect that changed host has already cost us the Authorization
     // header -- fetch drops it by spec, and rightly so. What comes back is a
@@ -207,8 +240,31 @@ async function broker(path, payload) {
 
     const detail = await response.json().catch(() => ({}));
     return { reached: true, ok: response.ok, status: response.status, detail };
-  } catch {
-    return { reached: false, ok: false, status: 0, detail: {} };
+  } catch (err) {
+    /*
+     * Why it could not be reached, rather than only that it could not be.
+     *
+     * This threw the error away and the operator was told to check their
+     * internet connection -- on the network that had activated their licence
+     * minutes earlier. Activation goes through the Rust side and this does not:
+     * they are different clients and they do not trust the same certificates.
+     *
+     * The difference that matters on Windows is the certificate store. Rust
+     * reads the operating system's; Node ships its own list and ignores it. So
+     * on a machine whose antivirus or church firewall inspects encrypted
+     * traffic -- which is most of them -- everything works except this, and the
+     * message blamed the one thing that was demonstrably fine.
+     */
+    const cause = (err && err.cause) || err;
+    const code = (cause && (cause.code || cause.name)) || "";
+    return {
+      reached: false,
+      ok: false,
+      status: 0,
+      detail: {},
+      why: code,
+      message: describe(cause),
+    };
   }
 }
 
@@ -234,11 +290,11 @@ async function openSession() {
   // refuses to start at all. Saying so here means an old install keeps working
   // on Azure and a new one moves, without anybody choosing which churches find
   // out on a Sunday.
-  const { reached, ok, detail } = await broker("session/start", {
+  const { reached, ok, detail, why, message } = await broker("session/start", {
     speaks: ["azure", "deepgram"],
   });
   if (!reached) {
-    fail("Could not reach your Castavox subscription. Check the internet connection.", true);
+    fail(reachError(why, message), true);
     return false;
   }
   if (!ok) {
@@ -418,6 +474,9 @@ function buildDeepgram() {
       authorization: HOSTED ? `Bearer ${authToken}` : `Token ${KEY}`,
     },
     handshakeTimeout: REQUEST_TIMEOUT_MS,
+    // The socket needs the proxy as much as the broker call does, and it is a
+    // separate client that would not have inherited it.
+    agent: proxyAgent || undefined,
   });
 
   /*
@@ -763,6 +822,48 @@ function scheduleRestart(reason) {
     restartTimer = null;
     if (!shuttingDown) startRecognition();
   }, RESTART_DELAY_MS);
+}
+
+/**
+ * What to tell somebody whose subscription could not be reached.
+ *
+ * "Check the internet connection" is wrong often enough to be worth this. A
+ * church activates a licence and then cannot start a session on the same
+ * network minutes later, because activation and this are different clients that
+ * trust different certificates.
+ *
+ * The certificate cases are named because they are the ones a person can act on
+ * and would never guess from the symptom. Everything else keeps the old advice,
+ * which is right when it is right.
+ */
+function reachError(code, detail) {
+  const certificate =
+    code === "SELF_SIGNED_CERT_IN_CHAIN" ||
+    code === "UNABLE_TO_VERIFY_LEAF_SIGNATURE" ||
+    code === "DEPTH_ZERO_SELF_SIGNED_CERT" ||
+    code === "CERT_HAS_EXPIRED" ||
+    code === "ERR_TLS_CERT_ALTNAME_INVALID";
+
+  if (certificate) {
+    return (
+      "Could not verify a secure connection to your subscription. Something on " +
+      "this machine or network is inspecting encrypted traffic -- usually " +
+      "antivirus or a church firewall. It is not blocking you; it is using a " +
+      `certificate this part of the app does not know about. (${code})`
+    );
+  }
+  if (code === "ETIMEDOUT" || code === "TimeoutError" || code === "AbortError") {
+    return "Your subscription did not answer in time. On a slow or filtered connection, try again.";
+  }
+  if (code === "ENOTFOUND" || code === "EAI_AGAIN") {
+    return "Could not look up the address of your subscription. Check DNS or the internet connection.";
+  }
+  if (code === "ECONNREFUSED" || code === "ECONNRESET") {
+    return PROXY
+      ? `The connection to your subscription was refused or dropped through the proxy at ${PROXY}. Check that it allows this machine out.`
+      : "The connection to your subscription was refused or dropped. A firewall or proxy may be blocking it.";
+  }
+  return `Could not reach your subscription. Check the internet connection. (${detail || "unknown error"})`;
 }
 
 function describe(err) {

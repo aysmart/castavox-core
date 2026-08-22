@@ -28,6 +28,7 @@ pub mod languages;
 pub mod log;
 pub mod mirror;
 pub mod node;
+pub mod proxy;
 pub mod tls;
 pub mod transcripts;
 pub mod update;
