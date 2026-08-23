@@ -145,5 +145,27 @@ whisper-rs = { version = "0.16", default-features = false, features = ["metal"] 
 # quietly fall back, because the fallback is a run-time one and this fails
 # before that. Windows on ARM therefore stays on the CPU, which is what shipped
 # before any of this, and it is a smaller loss than no arm64 build at all.
+# Not enabled here any more; see the `vulkan` feature below.
 [target.'cfg(all(target_os = "windows", target_arch = "x86_64"))'.dependencies]
-whisper-rs = { version = "0.16", default-features = false, features = ["vulkan"] }
+whisper-rs = { version = "0.16", default-features = false }
+
+# Vulkan on Windows, which a product opts into rather than receives.
+#
+# Building with it puts a *load-time* import of vulkan-1.dll into whatever links
+# this. On a machine with no Vulkan runtime -- an old laptop, a driver older
+# than the extension -- Windows refuses to start that process at all, and the
+# only sign is a dialogue naming a DLL nobody has heard of.
+#
+# The loader can be shipped alongside, and Castavox does exactly that: its
+# speech engine is a separate executable and the loader installs into the same
+# directory, which is where Windows looks.
+#
+# Pulpitry cannot. Its bundled files land under `resources/`, which the loader
+# never searches, so the same trick puts the DLL somewhere Windows will not find
+# and the application still refuses to open. Until that is solved properly --
+# delay-loading, or placing the file beside the executable -- Pulpitry on
+# Windows transcribes on the processor, which is what those machines were going
+# to do anyway.
+[features]
+default = []
+vulkan = ["whisper-rs/vulkan"]
