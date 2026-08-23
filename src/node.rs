@@ -62,6 +62,34 @@ pub fn system_ca_args(node: &NodeRuntime) -> Vec<String> {
     }
 }
 
+/// A path in the form Node can resolve.
+///
+/// Canonicalising a path on Windows yields the verbatim form, `\\?\C:\...`.
+/// The Windows API takes it happily and so does every Rust call that touches
+/// the file, which is why a script in that form is found, opened and read
+/// without complaint.
+///
+/// Node is a different matter. Its module resolver checks the root of the path
+/// before anything else, and `\\?\C:\` is not a root it can stat -- so a
+/// script that demonstrably exists is refused with `EISDIR` on the drive
+/// letter, before a line of it has run. From the outside the process simply
+/// dies at startup, saying nothing that sounds like a path problem.
+///
+/// Stripping the prefix costs nothing where it is absent, which is everywhere
+/// but Windows, and everywhere on Windows that never canonicalised.
+pub fn plain(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    // `\\?\UNC\server\share` is the verbatim form of `\\server\share`, so it
+    // becomes a UNC path again rather than losing its leading slashes.
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{rest}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => PathBuf::from(rest),
+        None => path.to_path_buf(),
+    }
+}
+
 /// What the settings screen shows, and why starting failed if it did.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -302,5 +330,29 @@ mod tests {
         };
         let message = missing_message(&stale);
         assert!(message.contains("v16.20.0"), "does not say what is installed: {message}");
+    }
+
+    #[test]
+    fn strips_the_verbatim_prefix_node_cannot_resolve() {
+        assert_eq!(
+            plain(Path::new(r"\\?\C:\Program Files\Pulpitry\speech.cjs")),
+            PathBuf::from(r"C:\Program Files\Pulpitry\speech.cjs")
+        );
+    }
+
+    #[test]
+    fn a_verbatim_unc_path_stays_a_unc_path() {
+        // Not `UNC\server\share`, which names nothing.
+        assert_eq!(
+            plain(Path::new(r"\\?\UNC\server\share\speech.cjs")),
+            PathBuf::from(r"\\server\share\speech.cjs")
+        );
+    }
+
+    #[test]
+    fn leaves_alone_a_path_that_never_had_the_prefix() {
+        for path in [r"C:\Pulpitry\speech.cjs", "/opt/pulpitry/speech.cjs", r"\\server\share\x"] {
+            assert_eq!(plain(Path::new(path)), PathBuf::from(path), "changed {path}");
+        }
     }
 }
