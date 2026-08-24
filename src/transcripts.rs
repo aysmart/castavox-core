@@ -385,6 +385,60 @@ fn duration_ms(words: usize) -> i64 {
     (words as i64) * 60_000 / 150
 }
 
+/// A leading `[11:28 PM]` or `[00:12:34]`, removed.
+///
+/// Our own export writes one on every line, and a transcript imported back in
+/// carried them into the words: the model was handed "[11:28 PM] Act 753 and
+/// what?" and the summary had timestamps in its quotations.
+///
+/// Deliberately narrow. Only a bracket at the very start, only digits, colons,
+/// spaces, dots and an am/pm inside it, and only a short one -- so a speaker
+/// who says "[applause]" or a transcript with "[inaudible]" keeps its words.
+fn strip_timestamp(line: &str) -> &str {
+    let rest = line.trim_start();
+    let Some(inner) = rest.strip_prefix('[') else { return line };
+    let Some(close) = inner.find(']') else { return line };
+    let stamp = &inner[..close];
+
+    if stamp.is_empty() || stamp.len() > 12 {
+        return line;
+    }
+    let looks_like_a_time = stamp.chars().any(|c| c.is_ascii_digit())
+        && stamp.chars().all(|c| {
+            c.is_ascii_digit() || matches!(c, ':' | '.' | ' ') || c.is_ascii_alphabetic()
+        })
+        && stamp.chars().filter(|c| c.is_ascii_alphabetic()).count() <= 2;
+
+    if looks_like_a_time {
+        inner[close + 1..].trim_start()
+    } else {
+        line
+    }
+}
+
+/// Our own export's header, and how much of the text it occupies.
+///
+/// The export opens with what it is, when it was, and how many segments it
+/// holds, then a blank line. Imported as words, that became the first thing the
+/// model read -- so a summary of a service could open by noting that the
+/// language was en-NG.
+fn header_lines(text: &str) -> usize {
+    let mut lines = text.lines();
+    if !lines.next().is_some_and(|first| first.trim().eq_ignore_ascii_case("pulpitry transcript")) {
+        return 0;
+    }
+    // Up to the blank line that ends it, and no further: a file that opens with
+    // that phrase and never blanks is taken at its word rather than eaten.
+    let mut count = 1;
+    for line in lines.take(8) {
+        count += 1;
+        if line.trim().is_empty() {
+            return count;
+        }
+    }
+    0
+}
+
 /// A blob of text as utterances.
 ///
 /// Blank-line-separated paragraphs first, because that is how a transcript
@@ -394,8 +448,9 @@ fn duration_ms(words: usize) -> i64 {
 /// search can usefully match.
 fn split(text: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for block in text.split(|c| c == '\n' || c == '\r') {
-        let block = block.trim();
+    let skip = header_lines(text);
+    for block in text.lines().skip(skip) {
+        let block = strip_timestamp(block).trim();
         if block.is_empty() {
             continue;
         }
@@ -601,6 +656,47 @@ mod tests {
         let lines = store.lines(id).unwrap();
         assert_eq!(lines.len(), 2, "carriage returns made phantom utterances");
         assert!(lines[0].text.starts_with("First"), "got {:?}", lines[0].text);
+    }
+
+    #[test]
+    fn our_own_export_comes_back_as_words_and_nothing_else() {
+        let store = Transcripts::in_memory().unwrap();
+        // Exactly what `Export…` writes, which is what an operator will pick.
+        let exported = "Pulpitry transcript\n\
+                        Sunday, August 2, 2026\n\
+                        Language: en-NG \u{b7} 78 segments\n\
+                        \n\
+                        [11:28 PM] Act 753 and what?\n\
+                        [11:29 PM] The law was given to the father.\n";
+        let id = store.import("Sunday", exported).unwrap();
+
+        let lines = store.lines(id).unwrap();
+        assert_eq!(lines.len(), 2, "the header was stored as if it had been spoken");
+        assert_eq!(lines[0].text, "Act 753 and what?");
+        assert_eq!(lines[1].text, "The law was given to the father.");
+
+        let session = store.get(id).unwrap().unwrap();
+        assert_eq!(session.word_count, 11, "the header was counted as speech");
+    }
+
+    #[test]
+    fn a_bracket_that_is_not_a_timestamp_is_left_alone() {
+        assert_eq!(strip_timestamp("[applause] and he said"), "[applause] and he said");
+        assert_eq!(strip_timestamp("[inaudible] the text"), "[inaudible] the text");
+        assert_eq!(strip_timestamp("[11:28 PM] the text"), "the text");
+        assert_eq!(strip_timestamp("[00:12:34] the text"), "the text");
+        assert_eq!(strip_timestamp("no bracket here"), "no bracket here");
+    }
+
+    #[test]
+    fn a_file_that_merely_starts_with_our_name_is_not_eaten() {
+        // No blank line to end a header, so there is no header: every word is
+        // the operator's and none of it may be dropped.
+        let store = Transcripts::in_memory().unwrap();
+        let id = store.import("Odd", "Pulpitry transcript was mentioned in the sermon today").unwrap();
+        let lines = store.lines(id).unwrap();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].text.starts_with("Pulpitry transcript was"), "got {:?}", lines[0].text);
     }
 
     #[test]
