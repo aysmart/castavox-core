@@ -196,6 +196,58 @@ impl Transcripts {
         Ok(())
     }
 
+    /// Adds a service from text that was written somewhere else.
+    ///
+    /// For a transcript that exists as a file: one recorded before this was
+    /// installed, one taken down by hand, or -- the reason it was written -- a
+    /// service whose summary needs testing without waiting four hours to speak
+    /// one. It becomes an ordinary past service, and everything that works on
+    /// those works on it.
+    ///
+    /// Deliberately not `begin`/`append`/`end`: those drive the *open* session,
+    /// and importing a file while a service is being recorded would close the
+    /// live one and take the operator's words with it. This touches the tables
+    /// and never the open handle, so it is safe mid-service.
+    ///
+    /// Timings are made up, and made up transparently. A file does not say when
+    /// its words were spoken, so lines are spaced at a steady reading pace --
+    /// enough for the transcript to scroll sensibly and for the service to have
+    /// a plausible length, and no more truthful than that.
+    pub fn import(&self, title: &str, text: &str) -> Result<i64> {
+        let lines = split(text);
+        if lines.is_empty() {
+            anyhow::bail!("there are no words in that file");
+        }
+
+        let words: usize = lines.iter().map(|line| line.split_whitespace().count()).sum();
+        let started_at = now_millis();
+
+        let mut connection = self.connection.lock();
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO transcript_sessions(started_at, ended_at, title, word_count) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![started_at, started_at + duration_ms(words), title.trim(), words as i64],
+        )?;
+        let id = transaction.last_insert_rowid();
+
+        let mut so_far = 0usize;
+        for line in &lines {
+            transaction.execute(
+                "INSERT INTO transcript_lines(session_id, at_ms, text) VALUES (?1, ?2, ?3)",
+                params![id, duration_ms(so_far), line],
+            )?;
+            let row = transaction.last_insert_rowid();
+            transaction.execute(
+                "INSERT INTO transcript_fts(rowid, text) VALUES (?1, ?2)",
+                params![row, line],
+            )?;
+            so_far += line.split_whitespace().count();
+        }
+        transaction.commit()?;
+        Ok(id)
+    }
+
     /// Closes the open session, if there is one.
     pub fn end(&self) -> Result<()> {
         let Some(open) = self.open.lock().take() else { return Ok(()) };
@@ -320,6 +372,59 @@ fn read_session(row: &rusqlite::Row<'_>) -> Session {
     }
 }
 
+/// Words at a steady pace, as milliseconds.
+///
+/// 150 a minute is unhurried speech. It is a guess and only ever a guess: an
+/// imported file carries no timings at all, and the alternative -- every line
+/// at zero -- makes a four-hour service look instantaneous in the list.
+fn duration_ms(words: usize) -> i64 {
+    (words as i64) * 60_000 / 150
+}
+
+/// A blob of text as utterances.
+///
+/// Blank-line-separated paragraphs first, because that is how a transcript
+/// people have edited tends to be laid out. A paragraph longer than a breath is
+/// then broken at sentence ends, so that one unbroken wall of text does not
+/// become a single line thousands of words long that no view can render and no
+/// search can usefully match.
+fn split(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for block in text.split(|c| c == '\n' || c == '\r') {
+        let block = block.trim();
+        if block.is_empty() {
+            continue;
+        }
+        if block.split_whitespace().count() <= LINE_WORDS {
+            out.push(block.to_string());
+            continue;
+        }
+
+        let mut current = String::new();
+        for word in block.split_whitespace() {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+            let ends_sentence = word.ends_with('.') || word.ends_with('?') || word.ends_with('!');
+            if ends_sentence && current.split_whitespace().count() >= LINE_WORDS / 2 {
+                out.push(std::mem::take(&mut current));
+            } else if current.split_whitespace().count() >= LINE_WORDS * 2 {
+                // No sentence end in sight; break anyway rather than grow
+                // without limit.
+                out.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.trim().is_empty() {
+            out.push(current);
+        }
+    }
+    out
+}
+
+/// About the length of a settled utterance from the recogniser.
+const LINE_WORDS: usize = 40;
+
 fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -433,5 +538,70 @@ mod tests {
         assert_eq!(session.title, "Coming Home");
         assert_eq!(session.summary, "A summary.", "retitling must not clear the summary");
         assert_eq!(session.topics, vec!["grace", "return"]);
+    }
+
+    #[test]
+    fn an_imported_file_becomes_a_service_with_every_word_kept() {
+        let store = Transcripts::in_memory().unwrap();
+        let text = "First line of the service.\n\nSecond line, after a blank.\nThird line.";
+        let id = store.import("Sunday teaching", text).unwrap();
+
+        let session = store.get(id).unwrap().expect("the service is in the list");
+        assert_eq!(session.title, "Sunday teaching");
+        assert_eq!(session.word_count, 12, "the count must match what was stored");
+        assert!(session.ended_at.is_some(), "an imported service is not still recording");
+
+        let lines = store.lines(id).unwrap();
+        assert_eq!(lines.len(), 3, "blank lines are separators, not utterances");
+        let joined = lines.iter().map(|l| l.text.as_str()).collect::<Vec<_>>().join(" ");
+        for word in ["First", "Second", "Third", "blank."] {
+            assert!(joined.contains(word), "{word} was lost on the way in");
+        }
+    }
+
+    #[test]
+    fn importing_does_not_disturb_a_service_being_recorded() {
+        let store = Transcripts::in_memory().unwrap();
+        let live = store.begin().unwrap();
+        store.append("spoken while the file was imported").unwrap();
+
+        let imported = store.import("From a file", "some words in a file").unwrap();
+        assert_ne!(imported, live);
+
+        // The live one is still the one being written to.
+        store.append("still recording").unwrap();
+        let lines = store.lines(live).unwrap();
+        assert_eq!(lines.len(), 2, "the import stole the open session");
+    }
+
+    #[test]
+    fn one_unbroken_wall_of_text_is_broken_into_utterances() {
+        let store = Transcripts::in_memory().unwrap();
+        let wall = (0..500).map(|i| format!("word{i}.")).collect::<Vec<_>>().join(" ");
+        let id = store.import("Wall", &wall).unwrap();
+
+        let lines = store.lines(id).unwrap();
+        assert!(lines.len() > 1, "a 500-word paragraph became a single line");
+        assert!(
+            lines.iter().all(|l| l.text.split_whitespace().count() <= LINE_WORDS * 2),
+            "a line grew without limit"
+        );
+        let total: usize = lines.iter().map(|l| l.text.split_whitespace().count()).sum();
+        assert_eq!(total, 500, "words were lost in the breaking");
+    }
+
+    #[test]
+    fn a_file_with_no_words_is_refused_rather_than_stored() {
+        let store = Transcripts::in_memory().unwrap();
+        assert!(store.import("Empty", "   \n\n  ").is_err());
+    }
+
+    #[test]
+    fn imported_lines_advance_in_time_so_the_service_has_a_length() {
+        let store = Transcripts::in_memory().unwrap();
+        let id = store.import("Paced", "one two three four five.\nsix seven eight nine ten.").unwrap();
+        let lines = store.lines(id).unwrap();
+        assert_eq!(lines[0].at_ms, 0);
+        assert!(lines[1].at_ms > 0, "every line claimed to be spoken at once");
     }
 }
