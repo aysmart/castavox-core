@@ -224,6 +224,48 @@ pub fn is_too_long_refusal(payload: &str) -> bool {
         || lower.contains("max_tokens exceed")
 }
 
+/// A long transcript cut into overlapping stretches, each small enough to send.
+///
+/// `size` and `overlap` are in words, because words are what a transcript is
+/// counted in and what an operator can reason about. Tokens are the thing the
+/// model actually counts, but the ratio depends on the model, so a word budget
+/// with room to spare beats a token budget that is wrong per deployment.
+///
+/// # Why they overlap
+///
+/// A teaching session does not divide at a word boundary. Cut it cleanly at
+/// word 12,000 and whatever was being argued across that line is halved: the
+/// passage is read at the end of one stretch and expounded at the start of the
+/// next, and neither summary has both. The overlap gives each stretch the tail
+/// of the one before, so a point that straddles a cut is whole in at least one
+/// of them. A little is repeated, and repetition is what the synthesis is for.
+///
+/// Returns one stretch -- the whole text -- when it already fits.
+pub fn chunks(text: &str, size: usize, overlap: usize) -> Vec<String> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    if words.len() <= size {
+        return vec![words.join(" ")];
+    }
+
+    // A stretch has to advance, or this never ends.
+    let step = size.saturating_sub(overlap).max(1);
+
+    let mut out = Vec::new();
+    let mut start = 0;
+    while start < words.len() {
+        let end = (start + size).min(words.len());
+        out.push(words[start..end].join(" "));
+        if end == words.len() {
+            break;
+        }
+        start += step;
+    }
+    out
+}
+
 /// Sends a chat completion and returns the message content.
 ///
 /// `body` is the request as the caller wants it — model, messages, whatever
@@ -319,6 +361,43 @@ fn content_of(payload: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_text_that_fits_is_one_stretch() {
+        let text = "a b c d e";
+        assert_eq!(chunks(text, 10, 2), vec!["a b c d e".to_string()]);
+    }
+
+    #[test]
+    fn stretches_overlap_so_nothing_straddles_a_cut_unseen() {
+        let words: Vec<String> = (0..10).map(|i| format!("w{i}")).collect();
+        let out = chunks(&words.join(" "), 4, 1);
+        // Steps of 3, so: 0-3, 3-6, 6-9, 9.
+        assert_eq!(out[0], "w0 w1 w2 w3");
+        assert_eq!(out[1], "w3 w4 w5 w6");
+        assert!(out.last().unwrap().ends_with("w9"), "the end is never dropped");
+    }
+
+    #[test]
+    fn every_word_survives_the_cutting() {
+        let words: Vec<String> = (0..1_000).map(|i| format!("w{i}")).collect();
+        let joined = words.join(" ");
+        let out = chunks(&joined, 130, 20);
+        for word in &words {
+            assert!(
+                out.iter().any(|c| c.split_whitespace().any(|w| w == word)),
+                "{word} was lost between stretches"
+            );
+        }
+    }
+
+    #[test]
+    fn an_overlap_as_large_as_the_stretch_still_terminates() {
+        let words: Vec<String> = (0..50).map(|i| format!("w{i}")).collect();
+        let out = chunks(&words.join(" "), 10, 10);
+        assert!(out.len() <= 50, "made no progress and looped");
+        assert!(out.last().unwrap().ends_with("w49"));
+    }
 
     #[test]
     fn recognises_a_refusal_on_length() {
