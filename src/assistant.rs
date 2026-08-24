@@ -230,6 +230,25 @@ pub fn is_too_long_refusal(payload: &str) -> bool {
         || lower.contains("too_long")
 }
 
+/// Whether the connection was intercepted rather than merely failing.
+///
+/// A school, office or hotel network may terminate HTTPS at an appliance and
+/// re-sign it with a certificate of its own. If that certificate is not trusted
+/// by the machine, every request fails at the handshake -- and the message it
+/// deserves is not "check the internet connection", because the connection is
+/// working perfectly and checking it will find nothing.
+///
+/// Seen in the field as an Infoblox appliance re-issuing our own domain:
+/// `invalid peer certificate: UnknownIssuer`.
+pub fn is_intercepted(detail: &str) -> bool {
+    let lower = detail.to_lowercase();
+    lower.contains("unknownissuer")
+        || lower.contains("invalid peer certificate")
+        || lower.contains("certificate verify failed")
+        || lower.contains("self-signed certificate")
+        || lower.contains("unable to get local issuer")
+}
+
 /// Whether the model's safety filter objected to the request.
 ///
 /// It objects to the *transcript*, and the transcript is what a machine heard,
@@ -474,6 +493,18 @@ mod tests {
         assert_eq!(retry_after(r#"{"reason":"busy","retry_after":"7"}"#), Some(7));
         assert_eq!(retry_after(r#"{"reason":"busy"}"#), None);
         assert_eq!(retry_after("not json at all"), None);
+    }
+
+    #[test]
+    fn recognises_a_network_that_intercepts_https() {
+        for detail in [
+            "invalid peer certificate: UnknownIssuer",
+            "certificate verify failed: unable to get local issuer certificate",
+        ] {
+            assert!(is_intercepted(detail), "not recognised: {detail}");
+        }
+        assert!(!is_intercepted("dns error: failed to lookup address"));
+        assert!(!is_intercepted("operation timed out"));
     }
 
     #[test]
