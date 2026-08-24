@@ -311,7 +311,7 @@ pub fn complete(
         body["response_format"] = serde_json::json!({ "type": "json_object" });
     }
 
-    match send(client, route, &body) {
+    match send_patiently(client, route, &body) {
         Ok(payload) => content_of(&payload),
         // Matched on the payload rather than on a rendered message. The
         // rendered one truncates at 300 characters, so a deployment that named
@@ -322,10 +322,60 @@ pub fn complete(
             // and read the answer more forgivingly; that is the caller's job.
             let mut plain = body;
             plain.as_object_mut().map(|map| map.remove("response_format"));
-            content_of(&send(client, route, &plain)?)
+            content_of(&send_patiently(client, route, &plain)?)
         }
         Err(failure) => Err(failure),
     }
+}
+
+/// How long to wait before giving up on a busy model, and how many times.
+///
+/// Four attempts over about half a minute. A quota resets on a rolling minute,
+/// so waiting minutes would be the wrong shape: either it clears inside this
+/// window or the deployment is too small for the work being asked of it, and
+/// the second is worth saying rather than waiting out.
+const BUSY_WAITS: [u64; 3] = [3, 8, 20];
+
+/// The same request, with room made for a model that is busy.
+///
+/// A long service is summarised in several requests, one per stretch and one
+/// to draw them together, and they go out as fast as they can be answered.
+/// That is enough to exhaust a deployment's per-minute quota: a 27,000-word
+/// service read in three stretches got through every stretch and was refused
+/// on the last request of the four, so all the work was done and none of it
+/// could be used.
+///
+/// Waiting is the whole remedy. `Retry-After` is honoured when the service
+/// sends one, because it knows better than any guess here.
+fn send_patiently(
+    client: &reqwest::blocking::Client,
+    route: &Route<'_>,
+    body: &serde_json::Value,
+) -> Result<String> {
+    for (attempt, wait) in BUSY_WAITS.iter().enumerate() {
+        match send(client, route, body) {
+            Err(Failure::Refused { status, payload }) if status.as_u16() == 429 => {
+                let seconds = retry_after(&payload).unwrap_or(*wait);
+                crate::log::line(&format!(
+                    "[assistant] busy; waiting {seconds}s before attempt {} of {}",
+                    attempt + 2,
+                    BUSY_WAITS.len() + 1
+                ));
+                std::thread::sleep(std::time::Duration::from_secs(seconds.min(60)));
+            }
+            other => return other,
+        }
+    }
+    send(client, route, body)
+}
+
+/// Seconds the service asked us to wait, if it named a number.
+fn retry_after(payload: &str) -> Option<u64> {
+    let value = serde_json::from_str::<serde_json::Value>(payload).ok()?;
+    let seconds = value.get("retryAfter").or_else(|| value.get("retry_after"))?;
+    seconds
+        .as_u64()
+        .or_else(|| seconds.as_str().and_then(|text| text.parse().ok()))
 }
 
 fn send(
@@ -417,6 +467,14 @@ fn content_of(payload: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_a_wait_the_service_asked_for() {
+        assert_eq!(retry_after(r#"{"reason":"busy","retryAfter":12}"#), Some(12));
+        assert_eq!(retry_after(r#"{"reason":"busy","retry_after":"7"}"#), Some(7));
+        assert_eq!(retry_after(r#"{"reason":"busy"}"#), None);
+        assert_eq!(retry_after("not json at all"), None);
+    }
 
     #[test]
     fn recognises_the_safety_filter() {
