@@ -197,6 +197,33 @@ pub fn is_response_format_refusal(payload: &str) -> bool {
     lower.contains("response_format") || lower.contains("json_object") || lower.contains("json mode")
 }
 
+/// Whether a refusal is the model saying the transcript was too long.
+///
+/// This is the difference between "the model could not be reached" and "the
+/// model was reached, read the whole request, and would not accept it" -- and
+/// telling a church the first when the second happened sends them to check a
+/// network that was never at fault. A four-hour teaching session produced a
+/// 27,000-word transcript, the deployment refused it on length, and the
+/// operator was advised to try again in a moment. It would have failed the same
+/// way every time.
+///
+/// Matched on the wording for the same reason as [`is_response_format_refusal`]:
+/// the families disagree on the code and the status. OpenAI and Azure send
+/// `context_length_exceeded`; Anthropic says the prompt is too long; others
+/// only ever mention the maximum context length. What they share is that they
+/// name it.
+pub fn is_too_long_refusal(payload: &str) -> bool {
+    let lower = payload.to_lowercase();
+    lower.contains("context_length_exceeded")
+        || lower.contains("string_above_max_length")
+        || lower.contains("maximum context length")
+        || lower.contains("context length")
+        || lower.contains("prompt is too long")
+        || lower.contains("too many tokens")
+        || lower.contains("reduce the length")
+        || lower.contains("max_tokens exceed")
+}
+
 /// Sends a chat completion and returns the message content.
 ///
 /// `body` is the request as the caller wants it — model, messages, whatever
@@ -292,6 +319,27 @@ fn content_of(payload: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognises_a_refusal_on_length() {
+        for payload in [
+            r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 8192 tokens"}}"#,
+            r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 214000 tokens > 200000"}}"#,
+            r#"{"error":{"message":"Please reduce the length of the messages."}}"#,
+        ] {
+            assert!(is_too_long_refusal(payload), "not recognised: {payload}");
+        }
+    }
+
+    #[test]
+    fn does_not_mistake_other_refusals_for_length() {
+        for payload in [
+            r#"{"error":{"code":"401","message":"Access denied due to invalid subscription key"}}"#,
+            r#"{"error":{"message":"response_format is not supported"}}"#,
+        ] {
+            assert!(!is_too_long_refusal(payload), "wrongly recognised: {payload}");
+        }
+    }
 
     #[test]
     fn a_refusal_about_json_mode_is_told_from_a_real_failure() {
