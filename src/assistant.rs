@@ -230,6 +230,26 @@ pub fn is_too_long_refusal(payload: &str) -> bool {
         || lower.contains("too_long")
 }
 
+/// Whether the model's safety filter objected to the request.
+///
+/// It objects to the *transcript*, and the transcript is what a machine heard,
+/// not what anybody said: "ended up dying" and "what a sorcerer" are what
+/// recognition made of an ordinary sermon. A church meets this through no fault
+/// of its own and no wording of theirs will avoid it.
+///
+/// Worth telling apart because the remedy is peculiar: the filter judges the
+/// whole prompt at once, so the same words split across smaller requests are
+/// usually accepted, and only the stretch that actually contains the offending
+/// phrase is refused.
+pub fn is_filtered_refusal(payload: &str) -> bool {
+    let lower = payload.to_lowercase();
+    lower.contains("content_filter")
+        || lower.contains("responsibleaipolicy")
+        || lower.contains("content management policy")
+        // Our broker's word for it, which is all the app sees on a subscription.
+        || lower.contains("\"filtered\"")
+}
+
 /// A long transcript cut into overlapping stretches, each small enough to send.
 ///
 /// `size` and `overlap` are in words, because words are what a transcript is
@@ -397,6 +417,17 @@ fn content_of(payload: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recognises_the_safety_filter() {
+        for payload in [
+            r#"{"error":{"code":"content_filter","message":"triggering Azure OpenAI's content management policy"}}"#,
+            r#"{"error":"assistant_failed","reason":"filtered","status":400}"#,
+        ] {
+            assert!(is_filtered_refusal(payload), "not recognised: {payload}");
+        }
+        assert!(!is_filtered_refusal(r#"{"reason":"too_long"}"#));
+    }
 
     #[test]
     fn a_text_that_fits_is_one_stretch() {
