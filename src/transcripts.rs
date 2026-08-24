@@ -214,7 +214,11 @@ impl Transcripts {
     /// enough for the transcript to scroll sensibly and for the service to have
     /// a plausible length, and no more truthful than that.
     pub fn import(&self, title: &str, text: &str) -> Result<i64> {
-        let lines = split(text);
+        // Windows text files begin with a byte order mark, which survives being
+        // read as UTF-8 and would otherwise be glued to the first word of the
+        // service -- and these files come from the machine the service was
+        // recorded on, which is usually a Windows one.
+        let lines = split(text.trim_start_matches('\u{feff}'));
         if lines.is_empty() {
             anyhow::bail!("there are no words in that file");
         }
@@ -588,6 +592,15 @@ mod tests {
         );
         let total: usize = lines.iter().map(|l| l.text.split_whitespace().count()).sum();
         assert_eq!(total, 500, "words were lost in the breaking");
+    }
+
+    #[test]
+    fn a_windows_file_does_not_bring_its_byte_order_mark_with_it() {
+        let store = Transcripts::in_memory().unwrap();
+        let id = store.import("From Windows", "\u{feff}First line.\r\nSecond line.").unwrap();
+        let lines = store.lines(id).unwrap();
+        assert_eq!(lines.len(), 2, "carriage returns made phantom utterances");
+        assert!(lines[0].text.starts_with("First"), "got {:?}", lines[0].text);
     }
 
     #[test]
