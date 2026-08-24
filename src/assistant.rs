@@ -333,6 +333,36 @@ fn send(
         .map_err(|error| Failure::Unreachable(because(&error)))?;
 
     let status = response.status();
+
+    /*
+     * Who answered, when the answer is a failure.
+     *
+     * A 502 can come from our broker, from the platform it runs on, or from a
+     * proxy in front of both, and the three mean entirely different things --
+     * a refusal we classified, a function that fell over, and a request that
+     * never arrived. They are indistinguishable from the body alone, and an
+     * afternoon went into guessing between them. The headers say plainly:
+     * `cf-ray` is set by the proxy, `x-vercel-id` by the platform, and a
+     * JSON content type means our own code composed the reply.
+     */
+    if !status.is_success() {
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("-")
+                .to_string()
+        };
+        crate::log::line(&format!(
+            "[assistant] {status} from server={} content-type={} cf-ray={} x-vercel-id={}",
+            header("server"),
+            header("content-type"),
+            header("cf-ray"),
+            header("x-vercel-id"),
+        ));
+    }
+
     let payload = response.text().unwrap_or_default();
 
     if status.is_redirection() {
