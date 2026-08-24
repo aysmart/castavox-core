@@ -222,6 +222,12 @@ pub fn is_too_long_refusal(payload: &str) -> bool {
         || lower.contains("too many tokens")
         || lower.contains("reduce the length")
         || lower.contains("max_tokens exceed")
+        // Our own broker's word for it. On a subscription the model's reply
+        // never reaches the app -- it describes our deployment -- so the broker
+        // classifies the refusal and sends back a reason instead. Without this
+        // the hosted path could never tell a transcript that was too long from
+        // the service being down, which is the whole fault this exists to fix.
+        || lower.contains("too_long")
 }
 
 /// A long transcript cut into overlapping stretches, each small enough to send.
@@ -405,6 +411,8 @@ mod tests {
             r#"{"error":{"code":"context_length_exceeded","message":"This model's maximum context length is 8192 tokens"}}"#,
             r#"{"error":{"type":"invalid_request_error","message":"prompt is too long: 214000 tokens > 200000"}}"#,
             r#"{"error":{"message":"Please reduce the length of the messages."}}"#,
+            // What our own broker sends on a subscription.
+            r#"{"error":"assistant_failed","reason":"too_long","status":400}"#,
         ] {
             assert!(is_too_long_refusal(payload), "not recognised: {payload}");
         }
