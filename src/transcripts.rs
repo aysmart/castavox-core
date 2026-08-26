@@ -424,7 +424,15 @@ fn strip_timestamp(line: &str) -> &str {
 /// language was en-NG.
 fn header_lines(text: &str) -> usize {
     let mut lines = text.lines();
-    if !lines.next().is_some_and(|first| first.trim().eq_ignore_ascii_case("pulpitry transcript")) {
+    // Either product's export. A Castavox transcript kept its header and fed
+    // "Language: en-NG - Synthetic long-form transcript" to the model as though
+    // somebody had said it, because this only knew the other name.
+    let ours = lines.next().is_some_and(|first| {
+        let first = first.trim();
+        first.eq_ignore_ascii_case("pulpitry transcript")
+            || first.eq_ignore_ascii_case("castavox transcript")
+    });
+    if !ours {
         return 0;
     }
     // Up to the blank line that ends it, and no further: a file that opens with
@@ -686,6 +694,20 @@ mod tests {
         assert_eq!(strip_timestamp("[11:28 PM] the text"), "the text");
         assert_eq!(strip_timestamp("[00:12:34] the text"), "the text");
         assert_eq!(strip_timestamp("no bracket here"), "no bracket here");
+    }
+
+    #[test]
+    fn either_product_s_export_is_recognised() {
+        let store = Transcripts::in_memory().unwrap();
+        let exported = "Castavox transcript\n\
+                        Wednesday, August 26, 2026\n\
+                        Language: en-NG \u{b7} 1 segment\n\
+                        \n\
+                        Good evening everyone.\n";
+        let id = store.import("Wednesday", exported).unwrap();
+        let lines = store.lines(id).unwrap();
+        assert_eq!(lines.len(), 1, "the header was stored as speech");
+        assert_eq!(lines[0].text, "Good evening everyone.");
     }
 
     #[test]
