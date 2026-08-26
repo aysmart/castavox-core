@@ -194,7 +194,13 @@ pub fn endpoint_url(endpoint: &str, api_version: &str) -> String {
 /// retry in one product and a failed summary in the other.
 pub fn is_response_format_refusal(payload: &str) -> bool {
     let lower = payload.to_lowercase();
-    lower.contains("response_format") || lower.contains("json_object") || lower.contains("json mode")
+    lower.contains("response_format")
+        || lower.contains("json_object")
+        || lower.contains("json mode")
+        // A deployment that takes `json_object` but not a schema says so about
+        // the schema, and the retry without any shape is the same remedy.
+        || lower.contains("json_schema")
+        || lower.contains("structured output")
 }
 
 /// Whether a refusal is the model saying the transcript was too long.
@@ -326,9 +332,18 @@ pub fn complete(
     mut body: serde_json::Value,
     strict_json: bool,
 ) -> Result<String> {
-    if strict_json {
+    /*
+     * A caller may bring its own, and a schema beats asking nicely.
+     *
+     * `strict_json` means "any JSON will do"; a caller that has set
+     * `response_format` itself has usually set a schema, which a model that
+     * supports one cannot break. Overwriting that with `json_object` would
+     * throw away the only enforcement available and leave the rules to prose.
+     */
+    if strict_json && body.get("response_format").is_none() {
         body["response_format"] = serde_json::json!({ "type": "json_object" });
     }
+    let asked_for_a_shape = body.get("response_format").is_some();
 
     match send_patiently(client, route, &body) {
         Ok(payload) => content_of(&payload),
@@ -336,7 +351,12 @@ pub fn complete(
         // rendered one truncates at 300 characters, so a deployment that named
         // the parameter later than that in its complaint never got the retry --
         // it simply failed, and looked like a deployment that was down.
-        Err(Failure::Refused { payload, .. }) if strict_json && is_response_format_refusal(&payload) => {
+        //
+        // Whoever set it: a deployment that cannot take a schema is refused the
+        // same way whether we asked for the shape or the caller did.
+        Err(Failure::Refused { payload, .. })
+            if asked_for_a_shape && is_response_format_refusal(&payload) =>
+        {
             // The deployment does not take the parameter. Ask again without it
             // and read the answer more forgivingly; that is the caller's job.
             let mut plain = body;
