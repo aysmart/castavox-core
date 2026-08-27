@@ -102,6 +102,15 @@ fn stamp_path(data_dir: &Path) -> PathBuf {
 /// Random rather than derived. A hash of the hardware would be stable across a
 /// reinstall, which sounds useful and is exactly what makes it a fingerprint --
 /// it would survive an operator deliberately starting fresh.
+/// The install id, for anything else that reports under the same consent.
+///
+/// Shared rather than duplicated: a second identifier would be a second thing
+/// to explain in the privacy policy and a second thing to be wrong about in a
+/// breach. See `made`, which is the only other caller.
+pub fn install(data_dir: &Path) -> String {
+    install_id(data_dir)
+}
+
 fn install_id(data_dir: &Path) -> String {
     let path = id_path(data_dir);
     if let Ok(existing) = std::fs::read_to_string(&path) {
