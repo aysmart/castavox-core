@@ -22,5 +22,5 @@ pub mod link;
 pub mod pairing;
 
 pub use discovery::{advertise, browse, find, Advertisement, Discovery, Peer, SERVICE_TYPE};
-pub use link::{Desk, Event, Line, Screen, Secret, Shown, Table};
+pub use link::{Desk, Event, Line, Point, Screen, Secret, Shown, Table};
 pub use pairing::{Answer, Challenge, Doorkeeper, Pairing, Verdict};

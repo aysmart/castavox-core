@@ -115,9 +115,32 @@ pub enum Shown {
         /// and read as the end of the sentence.
         #[serde(default, skip_serializing_if = "String::is_empty")]
         reference: String,
+        /// The slide's points, where they carry headings of their own.
+        ///
+        /// The same bargain the table strikes. `lines` still holds every point
+        /// flattened to "Silence: the prophetic silence had become normal", so
+        /// a screen with no room for panels -- a lower third is two tenths of a
+        /// frame -- has something it can draw. A screen with room draws the
+        /// panels and ignores the flattening.
+        ///
+        /// Empty for the ordinary slide, whose points have no headings and
+        /// were never cards.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        points: Vec<Point>,
     },
     /// Nothing is staged, or what is staged cannot be mirrored as text.
     Nothing,
+}
+
+/// One parallel point: a few words under a heading.
+///
+/// Only ever sent where the heading is real. A point without one is a line,
+/// and a panel drawn round a lone sentence is a bullet in a box.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Point {
+    pub heading: String,
+    pub text: String,
 }
 
 /// A comparison, as rows under headings.
@@ -734,6 +757,7 @@ mod tests {
                 rows: vec![vec!["Focuses on danger".into(), "Acts anyway".into()]],
             }),
             reference: "Joshua 1:9".into(),
+            points: vec![Point { heading: "Fear".into(), text: "asks what it costs".into() }],
         })
         .unwrap();
 
