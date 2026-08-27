@@ -66,6 +66,25 @@ pub struct Pack {
     /// What language a church would look for this under.
     #[serde(default)]
     pub language: String,
+    /**
+     * What a church should know before downloading, where there is something.
+     *
+     * Not every pack is a whole Bible, and the ones that are not look like a
+     * broken download unless something says otherwise. The Passion Translation
+     * has four Old Testament books because that is all of it there exists; the
+     * NIV and three others are short of the chapters that are lists, because
+     * the text we were given renders those as tables and the verses are simply
+     * not in it.
+     *
+     * Saying so costs a line in a list. Not saying so costs an operator the
+     * discovery that Ezra 2 is empty, during a service, with nothing on the
+     * screen explaining why.
+     */
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Verses absent against a complete Bible, counted at build time.
+    #[serde(default)]
+    pub missing_verses: i64,
     /// Where the text carries a licence, naming it is a condition of shipping
     /// it rather than a courtesy. See `bible.rs`.
     #[serde(default)]
@@ -208,6 +227,8 @@ mod tests {
             sha256: String::new(),
             bytes: 0,
             language: "English".into(),
+            note: None,
+            missing_verses: 0,
             licence: None,
             attribution: None,
         }
