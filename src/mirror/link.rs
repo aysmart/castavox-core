@@ -128,8 +128,26 @@ pub enum Shown {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         points: Vec<Point>,
     },
-    /// Nothing is staged, or what is staged cannot be mirrored as text.
-    Nothing,
+    /// Nothing the screen should draw.
+    ///
+    /// Three different things arrived here as one, and a screen cannot tell
+    /// them apart without being told: the desk has nothing staged, the desk
+    /// cleared on purpose, and the desk is showing a picture or a clip that
+    /// this protocol cannot carry. Only the middle one should blank a screen.
+    ///
+    /// The other two blanked it too, which is why pairing wiped whatever the
+    /// operator had, and why putting a picture on the wall took the lower
+    /// third off the stream with it.
+    ///
+    /// A field rather than a variant of its own, as with the table: a screen
+    /// built before this reads the unit variant and blanks, exactly as it does
+    /// now. There is a test for that.
+    Nothing {
+        /// True when the desk *is* showing something, and it is a shape this
+        /// protocol has no way to carry.
+        #[serde(default, skip_serializing_if = "not_showing")]
+        showing: bool,
+    },
 }
 
 /// One parallel point: a few words under a heading.
@@ -141,6 +159,11 @@ pub enum Shown {
 pub struct Point {
     pub heading: String,
     pub text: String,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn not_showing(showing: &bool) -> bool {
+    !*showing
 }
 
 /// A comparison, as rows under headings.
@@ -176,7 +199,16 @@ impl Table {
 
 impl Shown {
     pub fn is_nothing(&self) -> bool {
-        matches!(self, Shown::Nothing)
+        matches!(self, Shown::Nothing { .. })
+    }
+
+    /// Whether the desk is showing something it cannot send.
+    ///
+    /// Distinct from having cleared. A screen should hold what it has rather
+    /// than blank, because the desk has not asked for a blank -- it has put a
+    /// picture on a wall, which is a different surface entirely.
+    pub fn is_showing_unmirrorable(&self) -> bool {
+        matches!(self, Shown::Nothing { showing: true })
     }
 }
 
@@ -323,7 +355,7 @@ impl Desk {
 
         let inner = Arc::new(Mutex::new(Inner {
             door: Doorkeeper::new(known),
-            staged: Shown::Nothing,
+            staged: Shown::Nothing { showing: false },
             progress: 0.0,
             screens: Vec::new(),
             name: name.to_string(),
@@ -779,6 +811,28 @@ mod tests {
     }
 
     #[test]
+    fn a_screen_that_predates_showing_still_reads_a_blank() {
+        // The unit variant is what every screen in the field has. A blank must
+        // still read as a blank on one of those, or putting a picture on the
+        // wall stops the far overlay updating at all -- which is a worse bug
+        // than the one this field fixes.
+        #[derive(serde::Deserialize, Debug, PartialEq)]
+        #[serde(tag = "kind", rename_all = "camelCase")]
+        enum Older {
+            Scripture {},
+            Words {},
+            Nothing,
+        }
+
+        for showing in [false, true] {
+            let sent = serde_json::to_string(&Shown::Nothing { showing }).unwrap();
+            let read: Older = serde_json::from_str(&sent)
+                .unwrap_or_else(|e| panic!("an older screen could not read {sent}: {e}"));
+            assert_eq!(read, Older::Nothing, "read as the wrong thing: {sent}");
+        }
+    }
+
+    #[test]
     fn a_comparison_as_lines_keeps_its_headings() {
         let table = Table {
             header: vec!["Activity".into(), "Progress".into()],
@@ -873,15 +927,15 @@ mod tests {
 
         // Connected, then the empty state it joined into.
         assert!(matches!(next_after_pairing(&rx), Event::Connected { .. }));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing, 0.0));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing { showing: false }, 0.0));
 
         desk.stage(psalm(), 0.0);
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(psalm(), 0.0));
 
         // And a clear is a message like any other, so an operator clearing the
         // projector clears the overlay too.
-        desk.stage(Shown::Nothing, 0.0);
-        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing, 0.0));
+        desk.stage(Shown::Nothing { showing: false }, 0.0);
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing { showing: false }, 0.0));
     }
 
     #[test]
@@ -938,7 +992,7 @@ mod tests {
         });
 
         assert!(matches!(next_after_pairing(&rx), Event::Connected { .. }));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing, 0.0));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(Shown::Nothing { showing: false }, 0.0));
         desk.stage(psalm(), 0.0);
         assert_eq!(rx.recv_timeout(Duration::from_secs(3)).unwrap(), Event::Staged(psalm(), 0.0));
 
@@ -952,7 +1006,7 @@ mod tests {
         while let Ok(event) = rx.recv_timeout(Duration::from_millis(300)) {
             assert_ne!(
                 event,
-                Event::Staged(Shown::Nothing, 0.0),
+                Event::Staged(Shown::Nothing { showing: false }, 0.0),
                 "a dropped link must never blank the overlay",
             );
         }
