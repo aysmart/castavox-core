@@ -105,6 +105,16 @@ pub enum Shown {
         lines: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         table: Option<Table>,
+        /// A passage the words refer to, where they refer to one.
+        ///
+        /// Its own field for the same reason the table is: a screen draws a
+        /// citation differently from a sentence -- smaller, in the brand's
+        /// accent, sometimes in a badge -- and it cannot do any of that to a
+        /// line it cannot tell apart from prose. Run in with the body, "Matthew
+        /// 24-25" was set at body size in body colour underneath a statement,
+        /// and read as the end of the sentence.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reference: String,
     },
     /// Nothing is staged, or what is staged cannot be mirrored as text.
     Nothing,
@@ -723,6 +733,7 @@ mod tests {
                 header: vec!["Fear".into(), "Faith".into()],
                 rows: vec![vec!["Focuses on danger".into(), "Acts anyway".into()]],
             }),
+            reference: "Joshua 1:9".into(),
         })
         .unwrap();
 
