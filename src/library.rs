@@ -155,7 +155,25 @@ CREATE VIRTUAL TABLE IF NOT EXISTS verses_fts USING fts5(
 /// Anything else surfaces when the query that needs the column runs, with a
 /// message naming the column rather than the migration.
 fn migrate(connection: &Connection) {
-    for statement in ["ALTER TABLE lexicon ADD COLUMN thayer TEXT NOT NULL DEFAULT ''"] {
+    for statement in [
+        "ALTER TABLE lexicon ADD COLUMN thayer TEXT NOT NULL DEFAULT ''",
+        /*
+         * Where a translation's licence obliges us to name somebody.
+         *
+         * Recorded against the installed row rather than read from the bundled
+         * manifest, because the manifest only describes what ships. The moment
+         * a translation is downloaded rather than bundled -- which is the whole
+         * direction of travel here -- a manifest lookup returns nothing and the
+         * attribution silently stops being shown. For CC BY-SA that is not a
+         * cosmetic regression: naming the source is a condition of being
+         * allowed to ship the text at all.
+         *
+         * By migration and not a schema bump. A bump drops the tables, and a
+         * downloaded translation would then have to be downloaded again.
+         */
+        "ALTER TABLE translations ADD COLUMN licence TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE translations ADD COLUMN attribution TEXT NOT NULL DEFAULT ''",
+    ] {
         let _ = connection.execute(statement, []);
     }
 }
@@ -194,6 +212,49 @@ pub fn declined(connection: &Connection) -> Result<Vec<String>> {
     let mut statement = connection.prepare("SELECT id FROM declined")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// The texts whose licence obliges us to name them.
+///
+/// CC BY-SA permits the commercial use we make of these and asks for
+/// attribution in return, so this is a condition of shipping rather than a
+/// credit we chose to give. Read from what is installed, so it stays right when
+/// a translation is downloaded rather than bundled.
+///
+/// Deduplicated: five of the translations are Biblica's and one line covers all
+/// of them.
+pub fn attributions(connection: &Connection) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
+        "SELECT DISTINCT attribution, licence FROM translations
+         WHERE licence <> '' AND attribution <> ''
+         ORDER BY attribution",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(format!(
+            "{} — {}",
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?
+        ))
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Records a licence against a translation already installed without one.
+///
+/// Every existing installation imported its texts before there were columns to
+/// put this in, and an import only runs again when the text itself changes. So
+/// the obligation would not appear on those machines until some unrelated
+/// correction happened to trigger a reimport, which could be never.
+pub fn backfill_licence(connection: &Connection, pack: &Pack) -> Result<()> {
+    let (Some(licence), Some(attribution)) = (&pack.licence, &pack.attribution) else {
+        return Ok(());
+    };
+    connection.execute(
+        "UPDATE translations SET licence = ?2, attribution = ?3
+         WHERE id = ?1 AND licence = ''",
+        params![pack.id, licence, attribution],
+    )?;
+    Ok(())
 }
 
 /// Whether the installed copy matches the pack.
@@ -287,15 +348,27 @@ pub fn import(connection: &mut Connection, pack: &Pack, ordinal: i64, path: &Pat
     }
 
     transaction.execute(
-        "INSERT INTO translations(id, name, year, ordinal, checksum, verse_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "INSERT INTO translations(id, name, year, ordinal, checksum, verse_count,
+                                  licence, attribution)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(id) DO UPDATE SET
              name = excluded.name,
              year = excluded.year,
              ordinal = excluded.ordinal,
              checksum = excluded.checksum,
-             verse_count = excluded.verse_count",
-        params![id, pack.name, pack.year, ordinal, pack.checksum, imported],
+             verse_count = excluded.verse_count,
+             licence = excluded.licence,
+             attribution = excluded.attribution",
+        params![
+            id,
+            pack.name,
+            pack.year,
+            ordinal,
+            pack.checksum,
+            imported,
+            pack.licence.clone().unwrap_or_default(),
+            pack.attribution.clone().unwrap_or_default(),
+        ],
     )?;
     transaction.commit()?;
 
@@ -449,6 +522,62 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 1);
+    }
+
+    /// A licence follows its translation into the library, and is read back
+    /// from what is installed rather than from what happens to be bundled.
+    ///
+    /// That distinction is the whole point: the moment a CC BY-SA text is
+    /// downloaded instead of shipped, a manifest lookup returns nothing and we
+    /// quietly stop naming somebody we are obliged to name.
+    #[test]
+    fn an_attribution_survives_being_downloaded_rather_than_bundled() {
+        let dir = scratch("licence");
+        let mut connection = open();
+        let file = pack_file(&dir, "FBV", &[(1, "Genesis", 1, 1, "In the beginning")]);
+
+        let mut entry = pack("FBV", 1);
+        entry.licence = Some("CC BY-SA 4.0".into());
+        entry.attribution = Some("Free Bible Version © Dr. Jonathan Gallagher".into());
+        install(&mut connection, &entry, &file).unwrap();
+
+        assert_eq!(
+            attributions(&connection).unwrap(),
+            ["Free Bible Version © Dr. Jonathan Gallagher — CC BY-SA 4.0"]
+        );
+    }
+
+    /// One line covers five Biblica translations, not five identical lines.
+    #[test]
+    fn attributions_are_deduplicated() {
+        let dir = scratch("dedupe");
+        let mut connection = open();
+        for id in ["YOR", "IBO", "HAU"] {
+            let file = pack_file(&dir, id, &[(1, "Genesis", 1, 1, "In the beginning")]);
+            let mut entry = pack(id, 1);
+            entry.licence = Some("CC BY-SA 4.0".into());
+            entry.attribution = Some("Biblica® open edition © Biblica, Inc.".into());
+            install(&mut connection, &entry, &file).unwrap();
+        }
+        assert_eq!(attributions(&connection).unwrap().len(), 1);
+    }
+
+    /// A translation installed before there were columns for this gets them
+    /// filled in, and one that already has a licence is left alone.
+    #[test]
+    fn backfills_a_licence_recorded_before_there_was_anywhere_to_put_it() {
+        let dir = scratch("backfill");
+        let mut connection = open();
+        let file = pack_file(&dir, "FBV", &[(1, "Genesis", 1, 1, "In the beginning")]);
+        install(&mut connection, &pack("FBV", 1), &file).unwrap();
+        assert!(attributions(&connection).unwrap().is_empty());
+
+        let mut entry = pack("FBV", 1);
+        entry.licence = Some("CC BY-SA 4.0".into());
+        entry.attribution = Some("Free Bible Version © Dr. Jonathan Gallagher".into());
+        backfill_licence(&connection, &entry).unwrap();
+
+        assert_eq!(attributions(&connection).unwrap().len(), 1);
     }
 
     /// A truncated pack imports nothing rather than a Bible with holes in it.
