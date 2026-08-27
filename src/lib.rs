@@ -25,6 +25,7 @@ pub mod made;
 pub mod packs;
 pub mod embed;
 pub mod exports;
+pub mod feedback;
 pub mod hosted;
 pub mod languages;
 pub mod library;
