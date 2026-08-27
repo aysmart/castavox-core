@@ -86,9 +86,59 @@ pub enum Shown {
         lines: Vec<Line>,
     },
     /// Lyrics, or any authored block. Line breaks are the author's.
-    Words { title: String, lines: Vec<String> },
+    ///
+    /// `table` carries a comparison where the desk staged one -- "under the
+    /// law" beside "under grace" -- which is often the literal shape of the
+    /// argument rather than decoration on it. Flattening it into `lines` was
+    /// tried first and is what the desk still does for a screen that cannot
+    /// draw one: "Fear: focuses on what might go wrong - Faith: acknowledges
+    /// danger" repeated per row, which on a real overlay is a dense block
+    /// nobody reads.
+    ///
+    /// A field on `Words` rather than a variant of its own, deliberately: a
+    /// screen built before this existed ignores an unknown field and still
+    /// shows the lines, where an unknown *variant* would fail to parse and show
+    /// nothing at all. The two ends of this wire are updated separately and by
+    /// different churches.
+    Words {
+        title: String,
+        lines: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        table: Option<Table>,
+    },
     /// Nothing is staged, or what is staged cannot be mirrored as text.
     Nothing,
+}
+
+/// A comparison, as rows under headings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Table {
+    pub header: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+}
+
+impl Table {
+    /// The same comparison as lines, for a screen that draws no tables.
+    ///
+    /// Each row paired with its heading rather than run together: the columns
+    /// are the meaning, and "Fear Faith focuses acknowledges" is not a
+    /// comparison, it is four words.
+    pub fn as_lines(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .map(|(at, cell)| match self.header.get(at) {
+                        Some(head) if !head.trim().is_empty() => format!("{head}: {cell}"),
+                        _ => cell.clone(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" \u{b7} ")
+            })
+            .collect()
+    }
 }
 
 impl Shown {
@@ -658,6 +708,48 @@ mod tests {
         let token = desk.pairings().first().map(|p| p.token.clone()).unwrap_or_default();
         drop(handle);
         (token, seen)
+    }
+
+    #[test]
+    fn a_screen_that_predates_tables_still_reads_the_words() {
+        // The two ends of this wire are updated separately and by different
+        // churches, so a desk that has learnt about tables will be talking to
+        // screens that have not. An unknown field is ignored; an unknown
+        // variant would have shown nothing at all.
+        let sent = serde_json::to_string(&Shown::Words {
+            title: "Fear And Faith".into(),
+            lines: vec!["Fear: focuses on what might go wrong".into()],
+            table: Some(Table {
+                header: vec!["Fear".into(), "Faith".into()],
+                rows: vec![vec!["Focuses on danger".into(), "Acts anyway".into()]],
+            }),
+        })
+        .unwrap();
+
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "kind", rename_all = "camelCase")]
+        enum Older {
+            Scripture {},
+            Words { title: String, lines: Vec<String> },
+            Nothing,
+        }
+
+        match serde_json::from_str::<Older>(&sent).expect("an older screen could not read it") {
+            Older::Words { title, lines } => {
+                assert_eq!(title, "Fear And Faith");
+                assert_eq!(lines.len(), 1, "the lines it can draw are still there");
+            }
+            _ => panic!("read as the wrong thing"),
+        }
+    }
+
+    #[test]
+    fn a_comparison_as_lines_keeps_its_headings() {
+        let table = Table {
+            header: vec!["Activity".into(), "Progress".into()],
+            rows: vec![vec!["Keeps busy".into(), "Arrives".into()]],
+        };
+        assert_eq!(table.as_lines(), vec!["Activity: Keeps busy \u{b7} Progress: Arrives"]);
     }
 
     #[test]
