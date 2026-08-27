@@ -54,6 +54,15 @@ fn path(data_dir: &Path) -> PathBuf {
     data_dir.join("made")
 }
 
+/// What has been made and not yet reported, for a screen that shows it.
+///
+/// The same file the reporting reads, so an operator's number and ours cannot
+/// drift apart -- and it therefore falls when a report succeeds, which is
+/// honest: it says what is waiting to be sent, and the pane words it that way.
+pub fn tally(data_dir: &Path) -> Tally {
+    read(data_dir)
+}
+
 fn read(data_dir: &Path) -> Tally {
     std::fs::read_to_string(path(data_dir))
         .ok()
