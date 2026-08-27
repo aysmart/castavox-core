@@ -36,17 +36,44 @@ use serde::{Deserialize, Serialize};
 /// Short enough that a broker having a bad morning costs a launch nothing.
 const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// What has been made and not yet reported.
+/// What a machine has made, and how much of it the broker has heard about.
+///
+/// Two counters that only ever go up, rather than one that goes down as it is
+/// reported. What is waiting to be sent is the difference between them, which
+/// means there is no subtraction to get wrong -- and it means the number an
+/// operator is shown is the one they would say out loud: "we have made
+/// forty-seven summaries", not "seven are waiting to be reported", which is a
+/// sentence about our plumbing rather than about their church.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Tally {
+    /// Made on this machine, ever.
     pub summaries: u32,
     pub slides: u32,
+    /// How much of that has reached the broker.
+    ///
+    /// A file written before these existed reads them as zero, so the first
+    /// report sends everything counted so far and then keeps pace. That is the
+    /// right answer: nothing had been reported.
+    pub sent_summaries: u32,
+    pub sent_slides: u32,
 }
 
 impl Tally {
-    fn empty(&self) -> bool {
-        self.summaries == 0 && self.slides == 0
+    /// What has not reached the broker yet.
+    ///
+    /// Saturating, because a file edited by hand or restored from a backup can
+    /// claim more sent than made, and the answer to that is "nothing to send"
+    /// rather than an enormous number.
+    pub fn unsent(&self) -> (u32, u32) {
+        (
+            self.summaries.saturating_sub(self.sent_summaries),
+            self.slides.saturating_sub(self.sent_slides),
+        )
+    }
+
+    fn nothing_to_send(&self) -> bool {
+        self.unsent() == (0, 0)
     }
 }
 
@@ -54,11 +81,12 @@ fn path(data_dir: &Path) -> PathBuf {
     data_dir.join("made")
 }
 
-/// What has been made and not yet reported, for a screen that shows it.
+/// What this machine has made, for a screen that shows it.
 ///
 /// The same file the reporting reads, so an operator's number and ours cannot
-/// drift apart -- and it therefore falls when a report succeeds, which is
-/// honest: it says what is waiting to be sent, and the pane words it that way.
+/// drift apart. The totals do not move when a report succeeds -- only the sent
+/// counters do -- so what an operator sees is what their church has made and
+/// not a queue length.
 pub fn tally(data_dir: &Path) -> Tally {
     read(data_dir)
 }
@@ -107,15 +135,16 @@ pub fn send(enabled: bool, endpoint: &str, data_dir: &Path, app: &str) {
             // the check-in, which explains what this is guarding against.
             let sent = std::panic::catch_unwind(|| {
                 let tally = read(&data_dir);
-                if tally.empty() {
+                if tally.nothing_to_send() {
                     return None;
                 }
 
+                let (summaries, slides) = tally.unsent();
                 let body = serde_json::json!({
                     "install": crate::checkin::install(&data_dir),
                     "app": app,
-                    "summaries": tally.summaries,
-                    "slides": tally.slides,
+                    "summaries": summaries,
+                    "slides": slides,
                 });
 
                 let client = crate::tls::client().timeout(TIMEOUT).build().ok()?;
@@ -124,21 +153,22 @@ pub fn send(enabled: bool, endpoint: &str, data_dir: &Path, app: &str) {
                     .json(&body)
                     .send()
                     .is_ok_and(|reply| reply.status().is_success());
-                ok.then_some(tally)
+                ok.then_some((summaries, slides))
             });
 
             /*
-             * Subtracted rather than zeroed, and the difference is a Sunday.
+             * The sent counters advance; the totals are never touched.
              *
              * A summary written while this request was in flight is in the file
-             * and not in the request. Zeroing would throw it away; subtracting
-             * what was actually sent leaves it to go next time.
+             * and not in the request, and it stays waiting rather than being
+             * lost -- which is what a "zero the tally" would have cost, and a
+             * Sunday's work is exactly when that would have happened.
              */
-            if let Ok(Some(sent)) = sent {
-                let mut left = read(&data_dir);
-                left.summaries = left.summaries.saturating_sub(sent.summaries);
-                left.slides = left.slides.saturating_sub(sent.slides);
-                if let Ok(text) = serde_json::to_string(&left) {
+            if let Ok(Some((summaries, slides))) = sent {
+                let mut tally = read(&data_dir);
+                tally.sent_summaries = tally.sent_summaries.saturating_add(summaries);
+                tally.sent_slides = tally.sent_slides.saturating_add(slides);
+                if let Ok(text) = serde_json::to_string(&tally) {
                     let _ = std::fs::write(path(&data_dir), text);
                 }
             }
@@ -156,6 +186,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_total_survives_being_reported() {
+        // The number an operator is shown is what the church has made, not
+        // what is queued: reporting must not take it away from them.
+        let dir = scratch("reported");
+        record(&dir, 3, 1);
+
+        let mut tally = read(&dir);
+        assert_eq!(tally.unsent(), (3, 1));
+
+        // What a successful send does, without the network.
+        tally.sent_summaries = 3;
+        tally.sent_slides = 1;
+        std::fs::write(path(&dir), serde_json::to_string(&tally).unwrap()).unwrap();
+
+        let after = read(&dir);
+        assert_eq!(after.summaries, 3, "the total was taken away by reporting");
+        assert_eq!(after.unsent(), (0, 0), "something was reported twice");
+
+        // And a summary written after that report is waiting, not lost.
+        record(&dir, 1, 0);
+        let later = read(&dir);
+        assert_eq!(later.summaries, 4);
+        assert_eq!(later.unsent(), (1, 0));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
