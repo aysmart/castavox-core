@@ -76,6 +76,11 @@ mdns-sd = { version = "0.21", default-features = false }
 hmac = "0.12"
 sha2 = "0.10"
 
+# Reading a translation pack, which is a gzipped TSV. Both products already
+# depend on this for the same reason; it is here so the import that reads one is
+# written once rather than in each of them.
+flate2 = "1"
+
 # Local transcription, and fetching the models it runs on.
 # Local transcription, CPU everywhere. The GPU backends that accelerate it are
 # per-platform and live at the bottom of this file, where a table header cannot
