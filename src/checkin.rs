@@ -316,18 +316,27 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// The id is made on the machine and never leaves it in any other form.
+    ///
+    /// This replaces a test that checked the switch being off wrote nothing.
+    /// There is no switch now, so what is worth asserting instead is that the
+    /// identifier we do create is the only identifying thing here: random,
+    /// local, and deletable by the church that holds it.
     #[test]
-    fn a_switch_that_is_off_does_nothing_at_all() {
-        let dir = std::env::temp_dir().join(format!("checkin-off-{}", std::process::id()));
+    fn the_install_id_is_random_and_local() {
+        let dir = std::env::temp_dir().join(format!("checkin-id-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
         std::fs::create_dir_all(&dir).expect("temp dir");
 
-        send(false, "http://127.0.0.1:1/never", &dir, "pulpitry", "0.4.0", "local");
+        let first = install_id(&dir);
+        assert_eq!(first, install_id(&dir), "the same machine keeps its id");
+        assert!(first.len() >= 16, "not guessable: {first}");
 
-        // Not merely "sends nothing": writes nothing either. An install id
-        // created for somebody who declined would be an identifier we made
-        // without being allowed to.
-        assert!(!id_path(&dir).exists(), "no install id for an operator who said no");
-        assert!(!stamp_path(&dir).exists(), "no record of a check-in that never happened");
+        // Deleting the file is how a church becomes a new installation to us,
+        // which is the only forgetting available to somebody who cannot decline.
+        std::fs::remove_file(id_path(&dir)).expect("id file");
+        assert_ne!(first, install_id(&dir), "deleting the file starts again");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -339,7 +348,7 @@ mod tests {
         // A port nothing is listening on, so the request fails or hangs -- the
         // two things a church's firewall actually does to us.
         let began = std::time::Instant::now();
-        send(true, "http://127.0.0.1:9/blackhole", &dir, "pulpitry", "0.4.0", "local");
+        send("http://127.0.0.1:9/blackhole", &dir, "pulpitry", "0.4.0", "local");
         let took = began.elapsed();
 
         // Generous by three orders of magnitude, and still far below TIMEOUT:
@@ -354,7 +363,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("checkin-fail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
 
-        send(true, "http://127.0.0.1:9/blackhole", &dir, "pulpitry", "0.4.0", "local");
+        send("http://127.0.0.1:9/blackhole", &dir, "pulpitry", "0.4.0", "local");
         // Long enough for the attempt to have failed and returned.
         std::thread::sleep(Duration::from_millis(600));
 
