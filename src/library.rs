@@ -485,6 +485,7 @@ mod tests {
             sha256: String::new(),
             bytes: 0,
             language: "English".into(),
+            bundled: true,
             note: None,
             missing_verses: 0,
             licence: None,

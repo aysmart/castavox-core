@@ -67,6 +67,21 @@ pub struct Pack {
     #[serde(default)]
     pub language: String,
     /**
+     * Whether this translation's file is inside the application.
+     *
+     * The bundled manifest lists every translation we publish, not only the
+     * ones that ship, because it is also the register that says which texts
+     * carry a licence obliging us to name somebody. Trimming entries out of it
+     * would take those obligations with them.
+     *
+     * So the entry stays and the file does not, and this is how the first-run
+     * import tells the difference. True by default: a catalogue entry says
+     * nothing about what is bundled, and every manifest written before this
+     * field existed described a file that was.
+     */
+    #[serde(default = "yes")]
+    pub bundled: bool,
+    /**
      * What a church should know before downloading, where there is something.
      *
      * Not every pack is a whole Bible, and the ones that are not look like a
@@ -91,6 +106,10 @@ pub struct Pack {
     pub licence: Option<String>,
     #[serde(default)]
     pub attribution: Option<String>,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// Everything on offer, read from the published catalogue.
@@ -227,6 +246,7 @@ mod tests {
             sha256: String::new(),
             bytes: 0,
             language: "English".into(),
+            bundled: true,
             note: None,
             missing_verses: 0,
             licence: None,
