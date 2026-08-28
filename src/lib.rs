@@ -22,6 +22,7 @@ pub mod assistant;
 pub mod audio;
 pub mod canon;
 pub mod checkin;
+pub mod commands;
 pub mod made;
 pub mod packs;
 pub mod embed;
