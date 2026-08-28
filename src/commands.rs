@@ -15,14 +15,33 @@
 //!
 //! Three guards, and none of them is sufficient alone:
 //!
-//! 1. **A wake word.** Nothing counts unless the phrase begins with it. The
-//!    church chooses it; it defaults to the product's name.
+//! 1. **It has to be addressed to the machine.** A wake word does that, and is
+//!    the strongest form of it. Without one, the instruction has to be the
+//!    whole thing said rather than words inside a sentence — see below.
 //! 2. **Only the tail.** A command is acted on within a breath of being said or
 //!    not at all. The same phrase found in a paragraph that settled thirty
 //!    seconds ago is not a command, it is a coincidence.
 //! 3. **Never twice for one utterance.** A live transcript is revised as it
 //!    settles, so the same sentence arrives several times. A command that fires
 //!    per arrival advances three verses on one instruction.
+//!
+//! # Working without a wake word
+//!
+//! Saying the product's name before every instruction is a real cost during a
+//! service, so a church can leave the wake word empty. What replaces it is
+//! standing alone: with no wake word, the words have to be the *entire*
+//! utterance, and an instruction buried in a sentence is not one.
+//!
+//! That distinction does most of the work. "Next verse" said on its own is an
+//! operator; "and the next verse says something remarkable" is a preacher, and
+//! so is "let us go back to what Paul wrote" and "switch to the King James for
+//! a moment". A small number of ordinary words are ignored either side — "the",
+//! "please", "give me" — so "give me the King James" still works while "the
+//! King James is clearer here" does not.
+//!
+//! It is weaker than a wake word and honestly so: a preacher who pauses and
+//! says only "next verse" will move the screen. That is the trade a church
+//! makes, and it is why the wake word is still there for anyone who wants it.
 //!
 //! # What it deliberately cannot do
 //!
@@ -103,6 +122,32 @@ fn words(text: &str) -> Vec<String> {
         .collect()
 }
 
+/*
+ * Words that carry no instruction, dropped when there is no wake word.
+ *
+ * Small on purpose. Every word here is one that can no longer distinguish a
+ * command from a sentence containing one, so the list is the ordinary
+ * scaffolding of asking -- articles, politeness, and the verbs people put in
+ * front of a translation's name.
+ *
+ * "and" is deliberately absent, and it is the most important absence: it is the
+ * word that marks speech carrying on around a phrase. Keeping it is what stops
+ * "and the next verse says" from being heard as "next verse".
+ */
+const IGNORABLE: &[&str] = &[
+    "a", "an", "the", "please", "ok", "okay", "now", "just", "to", "me", "us", "give", "switch",
+    "read", "from", "let", "lets", "put", "up",
+];
+
+/// The words that actually ask for something, both ends trimmed.
+fn strip(tail: &[String]) -> String {
+    tail.iter()
+        .filter(|word| !IGNORABLE.contains(&word.as_str()))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Whether `haystack` contains `needle` as whole words.
 ///
 /// Both are already folded to single-spaced lower-case words, so this is a
@@ -153,32 +198,41 @@ impl Listener {
     /// `None` is the answer for almost everything ever said in a church, which
     /// is the design working rather than failing.
     pub fn hear(&mut self, transcript: &str) -> Option<Command> {
-        if self.wake.is_empty() {
-            return None;
-        }
-
         let spoken = words(transcript);
         let tail = &spoken[spoken.len().saturating_sub(TAIL)..];
 
-        // The wake word, and everything after the *last* one: an operator who
-        // corrects themselves mid-sentence meant the correction.
-        let wake: Vec<&str> = self.wake.split(' ').collect();
-        let Some(at) = tail
-            .windows(wake.len())
-            .rposition(|window| window.iter().zip(&wake).all(|(a, b)| a == b))
-        else {
-            // The moment has passed. Forgetting here is what lets the same
-            // instruction be given again later in the service.
-            self.last = None;
-            return None;
+        let (command, phrase) = if self.wake.is_empty() {
+            // Nothing to be addressed to, so the instruction has to stand
+            // alone. Ordinary words are dropped from both ends -- "give me the
+            // King James" is somebody asking; "the King James is clearer here"
+            // is somebody preaching, and only one of them is left as a bare
+            // translation name once those words are gone.
+            let bare = strip(tail);
+            if bare.is_empty() {
+                self.last = None;
+                return None;
+            }
+            self.match_exactly(&bare)?
+        } else {
+            // The wake word, and everything after the *last* one: an operator
+            // who corrects themselves mid-sentence meant the correction.
+            let wake: Vec<&str> = self.wake.split(' ').collect();
+            let Some(at) = tail
+                .windows(wake.len())
+                .rposition(|window| window.iter().zip(&wake).all(|(a, b)| a == b))
+            else {
+                // The moment has passed. Forgetting here is what lets the same
+                // instruction be given again later in the service.
+                self.last = None;
+                return None;
+            };
+
+            let rest = tail[at + wake.len()..].join(" ");
+            if rest.is_empty() {
+                return None;
+            }
+            self.match_phrase(&rest)?
         };
-
-        let rest = tail[at + wake.len()..].join(" ");
-        if rest.is_empty() {
-            return None;
-        }
-
-        let (command, phrase) = self.match_phrase(&rest)?;
 
         // Keyed on the phrase that matched, not on everything said after the
         // wake word. A live transcript keeps growing while it settles, so the
@@ -198,6 +252,33 @@ impl Listener {
     /// operator who says "next verse" twice in a row, deliberately, gets one.
     pub fn forget(&mut self) {
         self.last = None;
+    }
+
+    /// Matches only when the words are the whole instruction and nothing else.
+    ///
+    /// The test that replaces the wake word. `starts_with` would be no test at
+    /// all here: every sentence a preacher says beginning "next verse..." would
+    /// move the screen, which is exactly what the wake word existed to prevent.
+    fn match_exactly(&self, said: &str) -> Option<(Command, String)> {
+        for phrase in &self.custom {
+            let want = strip(&words(&phrase.said));
+            if !want.is_empty() && said == want {
+                return Some((phrase.does.clone(), want));
+            }
+        }
+
+        for (phrase, command) in BUILT_IN {
+            if said == strip(&words(phrase)) {
+                return Some((command.clone(), (*phrase).to_string()));
+            }
+        }
+
+        for (name, id) in &self.named {
+            if name.len() >= 3 && said == strip(&words(name)) {
+                return Some((Command::Switch { translation: id.clone() }, name.clone()));
+            }
+        }
+        None
     }
 
     /// The command, and the phrase that matched — which is what identifies the
@@ -386,11 +467,53 @@ mod tests {
         );
     }
 
-    /// A church that has not set one hears nothing, rather than everything.
+    /// Without a wake word an instruction still works — said on its own.
+    ///
+    /// Saying the product's name before every instruction is a real cost during
+    /// a service, so a church can go without. What replaces the wake word is
+    /// standing alone.
     #[test]
-    fn no_wake_word_means_no_commands() {
+    fn without_a_wake_word_a_bare_instruction_still_works() {
         let mut ear = Listener::new("", &translations(), &[]);
-        assert_eq!(ear.hear("next verse"), None);
+        assert_eq!(ear.hear("next verse"), Some(Command::NextVerse));
+        ear.forget();
+        assert_eq!(ear.hear("previous verse"), Some(Command::PreviousVerse));
+        ear.forget();
+        assert_eq!(ear.hear("clear the screen"), Some(Command::Clear));
+        ear.forget();
+        assert_eq!(
+            ear.hear("give me the King James"),
+            Some(Command::Switch { translation: "KJV".into() })
+        );
+    }
+
+    /// And the sermon still does not move the screen, which is the whole
+    /// reason the wake word was there. Buried in a sentence is not an
+    /// instruction, however exactly the words match.
+    #[test]
+    fn without_a_wake_word_a_sermon_is_still_not_a_command() {
+        let mut ear = Listener::new("", &translations(), &[]);
+        for said in [
+            "and the next verse says something remarkable",
+            "let us go back to what Paul wrote",
+            "I want to clear the screen of my mind",
+            "switch to the King James for a moment",
+            "the King James is clearer here",
+            "he read the next verse and then stopped",
+            "we will come back to that",
+        ] {
+            assert_eq!(ear.hear(said), None, "{said}");
+        }
+    }
+
+    /// A church's own word works bare too, which is the point of teaching it.
+    #[test]
+    fn a_bare_custom_phrase_works() {
+        let custom = vec![Phrase { said: "shema".into(), does: Command::NextVerse }];
+        let mut ear = Listener::new("", &translations(), &custom);
+        assert_eq!(ear.hear("shema"), Some(Command::NextVerse));
+        ear.forget();
+        assert_eq!(ear.hear("and then he said shema to them"), None);
     }
 
     /// The wake word alone is somebody saying the product's name.
