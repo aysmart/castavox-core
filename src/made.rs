@@ -119,10 +119,7 @@ pub fn record(data_dir: &Path, summaries: u32, slides: u32) {
 /// check-in gives at length: a "small file read" on a roaming profile or behind
 /// an antivirus scanner is where an application stops for four seconds on
 /// launch, and the operator is watching a splash screen.
-pub fn send(enabled: bool, endpoint: &str, data_dir: &Path, app: &str) {
-    if !enabled {
-        return;
-    }
+pub fn send(endpoint: &str, data_dir: &Path, app: &str) {
 
     let endpoint = endpoint.to_string();
     let data_dir = data_dir.to_path_buf();

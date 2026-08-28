@@ -1,17 +1,27 @@
-//! A once-a-day note that an install exists, if its operator agreed to it.
+//! A once-a-day note that an install exists.
 //!
-//! # The sentence this has to keep true
+//! # It is not optional, and that is a decision with consequences
 //!
-//! Our published privacy policy says, of the free local engine, that "nothing
-//! leaves the building at all". A check-in on launch makes that false for
-//! exactly the people it measures -- and the comment beside that policy records
-//! that every claim in it was checked against the code rather than borrowed
-//! from a template, so it is not boilerplate to quietly outgrow. It is also
-//! what we sell: the competitive position rests on working without a network.
+//! Every installation checks in. There is no switch, because a count that
+//! measures only the churches who agreed to be counted is not a count -- it is
+//! a floor with an unknown gap above it, and every conclusion drawn from it is
+//! wrong in the same direction.
 //!
-//! So this is **opt-in**, disclosed in one sentence on first run, and the policy
-//! changes in the same release. A church that never touches the switch is a
-//! church nothing leaves, and the old sentence stays true of them.
+//! **What that costs, stated plainly so nobody has to rediscover it.** The
+//! privacy policy used to say that on the free local engine "nothing leaves the
+//! building at all", and that sentence is now false: something leaves once a
+//! day. The policy has been changed to say so, in the same release. It has to
+//! stay changed.
+//!
+//! It also means the install id is collected without consent, which is a
+//! defensible position only while what it carries stays this small and while
+//! the policy says so before a church installs rather than after. If anybody
+//! later wants a field that identifies a person, a place, or anything said in a
+//! service, this stops being defensible and the answer is no.
+//!
+//! A church that objects can be forgotten: deleting the id file makes the
+//! installation a new one, and writing to support removes what is held. The
+//! policy says both.
 //!
 //! # What it carries, and what it refuses to
 //!
@@ -35,7 +45,7 @@
 //!
 //! # It never blocks anything, and never reaches anything
 //!
-//! The caller's thread checks one boolean and spawns. Every other cost --
+//! The caller's thread spawns and returns. Every other cost --
 //! reading whether a check-in is due, reading or making the install id, the
 //! request itself -- happens on the spawned thread, because a "small file
 //! read" on a roaming profile or behind an antivirus scanner is where an
@@ -173,13 +183,7 @@ fn due(data_dir: &Path) -> bool {
 ///
 /// `enabled` is the operator's switch, and a false here does nothing at all: no
 /// file is written, no thread is spawned, no request is made.
-pub fn send(enabled: bool, endpoint: &str, data_dir: &Path, app: &str, version: &str, engine: &str) {
-    // The one thing decided on the caller's thread, because it decides whether
-    // to have a thread at all.
-    if !enabled {
-        return;
-    }
-
+pub fn send(endpoint: &str, data_dir: &Path, app: &str, version: &str, engine: &str) {
     let endpoint = endpoint.to_string();
     let data_dir = data_dir.to_path_buf();
     let app = app.to_string();
