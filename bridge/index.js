@@ -374,6 +374,23 @@ async function heartbeat() {
     fail(detail.message || "This Castavox subscription is no longer active.", true);
     shutdown(1);
     return;
+  } else if (status === 404) {
+    /*
+     * The session is gone from the broker.
+     *
+     * Either this same machine started another one and superseded this, or
+     * somebody ended it from the subscription page. Both are deliberate, and
+     * both mean nothing we send from here will ever be recorded again -- the
+     * heartbeat that reports what a church has used is the thing returning 404.
+     *
+     * So stopping is the only honest response. Carrying on would stream audio
+     * we are charged for and cannot bill, quietly, for as long as the machine
+     * stayed open. Exit zero: this is a session ending as somebody asked, not a
+     * fault.
+     */
+    fail(detail.message || "This session was closed. Another one may have taken over.", true);
+    shutdown(0);
+    return;
   } else if (!reached) {
     // Offline mid-service. Keep listening on the token in hand and say so, so
     // the operator knows why the counter has stopped moving.
