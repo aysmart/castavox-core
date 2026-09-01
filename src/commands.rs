@@ -78,6 +78,27 @@ pub enum Command {
     Clear,
     /// Read from another translation, named however it was said.
     Switch { translation: String },
+
+    /*
+     * Moving about the book being read.
+     *
+     * A verse at a time is what an operator does most, and a chapter at a time
+     * is what they do when the reading moves on -- "turn with me to chapter
+     * four" is said aloud in most services, and until now the only answer was
+     * to reach for the laptop.
+     *
+     * The book is never part of these. Saying a book name aloud is what
+     * scripture *detection* already listens for, and it puts the passage in the
+     * detected list; a command that also jumped the browser would be two things
+     * happening for one sentence. These move within what is already open.
+     */
+    NextChapter,
+    PreviousChapter,
+    /// "chapter four" -- that chapter of the book being read.
+    Chapter { chapter: i64 },
+    /// "chapter four verse nine" -- and "verse nine" on its own, which keeps
+    /// the chapter.
+    Passage { chapter: Option<i64>, verse: i64 },
 }
 
 /// A phrase a church has taught the application, pointed at an action.
@@ -94,6 +115,10 @@ pub struct Phrase {
 /// Ordered longest first where two overlap, because "previous verse" contains
 /// "verse" and the longer reading is the one that was meant.
 const BUILT_IN: &[(&str, Command)] = &[
+    ("previous chapter", Command::PreviousChapter),
+    ("last chapter", Command::PreviousChapter),
+    ("chapter back", Command::PreviousChapter),
+    ("next chapter", Command::NextChapter),
     ("previous verse", Command::PreviousVerse),
     ("verse back", Command::PreviousVerse),
     ("go back", Command::PreviousVerse),
@@ -315,12 +340,86 @@ impl Listener {
             }
         }
 
+        // Standing alone, so the whole utterance has to be the instruction:
+        // "chapter four" is an operator, "in chapter four Paul writes" is not.
+        // Measured by words consumed, because the words asking and the words
+        // returned as a key are deliberately not the same thing.
+        let spoken: Vec<String> = said.split(' ').map(str::to_string).collect();
+        if let Some((command, key, consumed)) = Self::match_passage(&spoken) {
+            if consumed == spoken.len() && spoken.first().is_some_and(|w| w == "chapter" || w == "verse") {
+                return Some((command, key));
+            }
+        }
+
         for (name, id) in &self.named {
             if name.len() >= 3 && said == strip(&words(name)) {
                 return Some((Command::Switch { translation: id.clone() }, name.clone()));
             }
         }
         None
+    }
+
+    /// "chapter four", "chapter four verse nine", "verse nine".
+    ///
+    /// Read after the fixed phrases and before translation names, because a
+    /// number is the least ambiguous thing anybody says: "chapter" followed by
+    /// one is not a sentence that happens by accident.
+    ///
+    /// Numbers are read as they are spoken -- "chapter twenty eight" is one
+    /// chapter, not chapter twenty and an eight -- by the same reader that
+    /// interprets a spoken reference.
+    ///
+    /// Returns how many words the instruction actually used, which is what
+    /// lets the caller tell "chapter four" said on its own from the same words
+    /// inside a sentence. Counting them rather than slicing a fixed number is
+    /// the point: a number can be several words long.
+    fn match_passage(words: &[String]) -> Option<(Command, String, usize)> {
+        let chapter_at = words.iter().position(|word| word == "chapter");
+        let verse_at = words.iter().position(|word| word == "verse");
+        if chapter_at.is_none() && verse_at.is_none() {
+            return None;
+        }
+
+        // Only the numbers that follow the word they belong to, so "verse nine"
+        // inside "chapter four verse nine" is not read as the chapter. Returns
+        // the value and where its words ended.
+        let after = |at: Option<usize>, stop: Option<usize>| -> Option<(i64, usize)> {
+            let start = at? + 1;
+            let end = stop.filter(|s| *s > start).unwrap_or(words.len());
+            let slice = words.get(start..end)?;
+            let value = *crate::numbers::read_numbers(slice).first()?;
+
+            // How far the number ran. Anything that reads as part of a number
+            // belongs to it; the first word that does not ends the phrase.
+            let mut used = start;
+            while used < end && crate::numbers::word_value(&words[used]).is_some()
+                || (used < end && words[used] == "hundred")
+            {
+                used += 1;
+            }
+            Some((value, used))
+        };
+
+        let chapter = after(chapter_at, verse_at);
+        let verse = after(verse_at, None);
+
+        let consumed = verse.map(|(_, at)| at).or(chapter.map(|(_, at)| at))?;
+
+        // Keyed on what was asked for rather than on the words that asked, so
+        // the same instruction phrased twice is one instruction and a different
+        // chapter is a different one.
+        match (chapter.map(|(v, _)| v), verse.map(|(v, _)| v)) {
+            (chapter, Some(verse)) => Some((
+                Command::Passage { chapter, verse },
+                format!("passage {chapter:?} {verse}"),
+                consumed,
+            )),
+            (Some(chapter), None) => {
+                Some((Command::Chapter { chapter }, format!("chapter {chapter}"), consumed))
+            }
+            // "chapter" with no number is somebody talking about a chapter.
+            (None, None) => None,
+        }
     }
 
     /// The command, and the phrase that matched — which is what identifies the
@@ -338,6 +437,11 @@ impl Listener {
             if said.starts_with(phrase) {
                 return Some((command.clone(), (*phrase).to_string()));
             }
+        }
+
+        let spoken: Vec<String> = said.split(' ').map(str::to_string).collect();
+        if let Some((command, key, _)) = Self::match_passage(&spoken) {
+            return Some((command, key));
         }
 
         // "switch to the ESV", "give me the King James", "read from the NIV".
@@ -464,6 +568,113 @@ mod tests {
         // it is dropped so the next one is heard.
         assert_eq!(ear.hear("next verse and then he said", true), None);
         assert_eq!(ear.hear("next verse", true), Some(Command::NextVerse));
+    }
+
+    #[test]
+    fn hears_a_chapter_moved_by_one() {
+        let mut ear = listener();
+        assert_eq!(ear.hear("next chapter", false), Some(Command::NextChapter));
+        ear.forget();
+        assert_eq!(ear.hear("previous chapter", false), Some(Command::PreviousChapter));
+        ear.forget();
+        assert_eq!(ear.hear("castavox last chapter", false), Some(Command::PreviousChapter));
+    }
+
+    /// "Chapter four", however the recogniser wrote the number.
+    #[test]
+    fn hears_a_chapter_by_number() {
+        for said in ["chapter four", "chapter 4"] {
+            let mut ear = listener();
+            assert_eq!(ear.hear(said, false), Some(Command::Chapter { chapter: 4 }), "{said}");
+        }
+    }
+
+    /// The number is read as it is spoken. "Chapter twenty eight" is one
+    /// chapter, not chapter twenty followed by an eight.
+    #[test]
+    fn a_spoken_number_is_one_number() {
+        let mut ear = listener();
+        assert_eq!(
+            ear.hear("chapter twenty eight", false),
+            Some(Command::Chapter { chapter: 28 })
+        );
+    }
+
+    #[test]
+    fn hears_a_chapter_and_a_verse() {
+        let mut ear = listener();
+        assert_eq!(
+            ear.hear("chapter four verse nine", false),
+            Some(Command::Passage { chapter: Some(4), verse: 9 })
+        );
+    }
+
+    /// A verse on its own keeps the chapter that is open, which is what
+    /// somebody reading through a passage means by it.
+    #[test]
+    fn hears_a_verse_on_its_own() {
+        let mut ear = listener();
+        assert_eq!(
+            ear.hear("verse sixteen", false),
+            Some(Command::Passage { chapter: None, verse: 16 })
+        );
+    }
+
+    /// The wake word buys the usual latitude: anything may follow it.
+    #[test]
+    fn a_wake_word_still_takes_a_passage_mid_sentence() {
+        let mut ear = listener();
+        assert_eq!(
+            ear.hear("castavox chapter four verse nine please", false),
+            Some(Command::Passage { chapter: Some(4), verse: 9 })
+        );
+    }
+
+    /// And without one, the sentence a preacher actually says moves nothing.
+    /// This is the case the whole design exists for, and chapters are said
+    /// aloud far more often than "next verse" ever is.
+    #[test]
+    fn a_chapter_mentioned_in_preaching_is_not_a_command() {
+        let mut ear = listener();
+        for said in [
+            "in chapter four Paul writes about this",
+            "if you look at the next chapter you will see",
+            "we read chapter twenty eight last week",
+            "the previous chapter ends with a question",
+            "verse sixteen is the one everybody knows",
+        ] {
+            assert_eq!(ear.hear(said, false), None, "{said}");
+        }
+    }
+
+    /// "Chapter" with no number is somebody talking about one.
+    #[test]
+    fn a_chapter_with_no_number_asks_for_nothing() {
+        let mut ear = listener();
+        assert_eq!(ear.hear("chapter", false), None);
+        assert_eq!(ear.hear("castavox chapter", false), None);
+    }
+
+    /// Two different chapters asked for in a row are two instructions; the
+    /// same one twice while the sentence settles is one.
+    #[test]
+    fn a_different_chapter_is_a_different_instruction() {
+        let mut ear = listener();
+        assert_eq!(ear.hear("chapter four", false), Some(Command::Chapter { chapter: 4 }));
+        assert_eq!(ear.hear("chapter four", false), None);
+        assert_eq!(ear.hear("chapter five", false), Some(Command::Chapter { chapter: 5 }));
+    }
+
+    /// The trailing words of a longer number belong to it. Without counting
+    /// them, "chapter twenty eight" read as "chapter twenty" plus a stray word
+    /// and stopped being a whole utterance.
+    #[test]
+    fn a_long_number_is_still_the_whole_instruction() {
+        let mut ear = listener();
+        assert_eq!(
+            ear.hear("chapter one hundred nineteen", false),
+            Some(Command::Chapter { chapter: 119 })
+        );
     }
 
     /// Said again on purpose, after something else, is a second instruction.
