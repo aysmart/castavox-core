@@ -292,6 +292,27 @@ impl Listener {
     /// `None` is the answer for almost everything ever said in a church, which
     /// is the design working rather than failing.
     pub fn hear(&mut self, transcript: &str, ended: bool) -> Option<Command> {
+        /*
+         * Only a finished sentence is an instruction.
+         *
+         * A sentence still being revised is a sentence whose meaning can still
+         * change, and several of these commands are prefixes of each other:
+         * "next chapter" is complete and correct, and "next chapter verse
+         * nine" is a different and more correct instruction two words later.
+         * Acting on the first moved a chapter, and acting on the second moved
+         * another -- two chapters for one instruction, which is what this
+         * guard exists to stop. "Switch to the King James" and "switch to the
+         * New King James" are the same trap.
+         *
+         * The cost is a beat: on a streaming engine the final arrives when the
+         * operator stops speaking, and on the local engine that is when a
+         * sentence was ever transcribed at all. Still faster than reaching for
+         * the laptop, which is the whole point.
+         */
+        if !ended {
+            return None;
+        }
+
         let spoken = words(transcript);
         let tail = &spoken[spoken.len().saturating_sub(TAIL)..];
 
@@ -584,44 +605,21 @@ mod tests {
     #[test]
     fn hears_the_plain_instructions() {
         let mut ear = listener();
-        assert_eq!(ear.hear("castavox next verse", false), Some(Command::NextVerse));
+        assert_eq!(ear.hear("castavox next verse", true), Some(Command::NextVerse));
         ear.forget();
-        assert_eq!(ear.hear("Castavox, previous verse.", false), Some(Command::PreviousVerse));
+        assert_eq!(ear.hear("Castavox, previous verse.", true), Some(Command::PreviousVerse));
         ear.forget();
-        assert_eq!(ear.hear("castavox clear the screen", false), Some(Command::Clear));
+        assert_eq!(ear.hear("castavox clear the screen", true), Some(Command::Clear));
     }
 
     /// The whole reason for the wake word. A preacher saying this is preaching.
     #[test]
     fn a_sermon_is_not_a_command() {
         let mut ear = listener();
-        assert_eq!(ear.hear("and the next verse says something remarkable", false), None);
-        assert_eq!(ear.hear("let us go back to what Paul wrote", false), None);
-        assert_eq!(ear.hear("I want to clear the screen of my mind", false), None);
-        assert_eq!(ear.hear("switch to the King James for a moment", false), None);
-    }
-
-    /// One instruction is obeyed once, however many times the transcript is
-    /// revised. Without this a single "next verse" advances three.
-    #[test]
-    fn a_settling_transcript_does_not_repeat_the_command() {
-        let mut ear = listener();
-        assert_eq!(ear.hear("castavox next", false), None);
-        assert_eq!(ear.hear("castavox next verse", false), Some(Command::NextVerse));
-        assert_eq!(ear.hear("castavox next verse", false), None);
-        assert_eq!(ear.hear("castavox next verse.", false), None);
-    }
-
-    /// The transcript keeps growing while a sentence settles, so the words
-    /// after the command are different every time it arrives. Keyed on all of
-    /// them, one "next verse" would advance three or four.
-    #[test]
-    fn a_command_does_not_fire_again_as_more_is_said_after_it() {
-        let mut ear = listener();
-        assert_eq!(ear.hear("castavox next verse", false), Some(Command::NextVerse));
-        assert_eq!(ear.hear("castavox next verse and", false), None);
-        assert_eq!(ear.hear("castavox next verse and then", false), None);
-        assert_eq!(ear.hear("castavox next verse and then he said", false), None);
+        assert_eq!(ear.hear("and the next verse says something remarkable", true), None);
+        assert_eq!(ear.hear("let us go back to what Paul wrote", true), None);
+        assert_eq!(ear.hear("I want to clear the screen of my mind", true), None);
+        assert_eq!(ear.hear("switch to the King James for a moment", true), None);
     }
 
     /// A wake word is a whole word. A church that chooses a short one should
@@ -629,8 +627,8 @@ mod tests {
     #[test]
     fn the_wake_word_is_not_matched_inside_another_word() {
         let mut ear = Listener::new("bee", &translations(), &books(), &[]);
-        assert_eq!(ear.hear("the beef next verse", false), None);
-        assert_eq!(ear.hear("bee next verse", false), Some(Command::NextVerse));
+        assert_eq!(ear.hear("the beef next verse", true), None);
+        assert_eq!(ear.hear("bee next verse", true), Some(Command::NextVerse));
     }
 
     /// Same for a translation name, which is matched anywhere after the wake
@@ -638,7 +636,7 @@ mod tests {
     #[test]
     fn a_translation_is_not_matched_inside_another_word() {
         let mut ear = listener();
-        assert_eq!(ear.hear("castavox tell the university about it", false), None);
+        assert_eq!(ear.hear("castavox tell the university about it", true), None);
     }
 
     /// Two verses in a row, which is the most ordinary thing an operator does.
@@ -656,29 +654,14 @@ mod tests {
         assert_eq!(ear.hear("next verse", true), Some(Command::NextVerse));
     }
 
-    /// And the same words while the engine is still revising them are still
-    /// one instruction, which is what this whole guard exists for.
-    #[test]
-    fn a_settling_utterance_is_still_only_obeyed_once() {
-        let mut ear = listener();
-        assert_eq!(ear.hear("next", false), None);
-        assert_eq!(ear.hear("next verse", false), Some(Command::NextVerse));
-        assert_eq!(ear.hear("next verse", false), None);
-        assert_eq!(ear.hear("next verse and", false), None);
-        // The final of that same utterance: still nothing, and the memory of
-        // it is dropped so the next one is heard.
-        assert_eq!(ear.hear("next verse and then he said", true), None);
-        assert_eq!(ear.hear("next verse", true), Some(Command::NextVerse));
-    }
-
     #[test]
     fn hears_a_chapter_moved_by_one() {
         let mut ear = listener();
-        assert_eq!(ear.hear("next chapter", false), Some(Command::Passage { book: None, chapter: None, by: 1, verse: None }));
+        assert_eq!(ear.hear("next chapter", true), Some(Command::Passage { book: None, chapter: None, by: 1, verse: None }));
         ear.forget();
-        assert_eq!(ear.hear("previous chapter", false), Some(Command::Passage { book: None, chapter: None, by: -1, verse: None }));
+        assert_eq!(ear.hear("previous chapter", true), Some(Command::Passage { book: None, chapter: None, by: -1, verse: None }));
         ear.forget();
-        assert_eq!(ear.hear("castavox last chapter", false), Some(Command::Passage { book: None, chapter: None, by: -1, verse: None }));
+        assert_eq!(ear.hear("castavox last chapter", true), Some(Command::Passage { book: None, chapter: None, by: -1, verse: None }));
     }
 
     /// "Chapter four", however the recogniser wrote the number.
@@ -686,7 +669,7 @@ mod tests {
     fn hears_a_chapter_by_number() {
         for said in ["chapter four", "chapter 4"] {
             let mut ear = listener();
-            assert_eq!(ear.hear(said, false), Some(Command::Passage { book: None, chapter: Some(4), by: 0, verse: None }), "{said}");
+            assert_eq!(ear.hear(said, true), Some(Command::Passage { book: None, chapter: Some(4), by: 0, verse: None }), "{said}");
         }
     }
 
@@ -696,7 +679,7 @@ mod tests {
     fn a_spoken_number_is_one_number() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("chapter twenty eight", false),
+            ear.hear("chapter twenty eight", true),
             Some(Command::Passage { book: None, chapter: Some(28), by: 0, verse: None })
         );
     }
@@ -705,7 +688,7 @@ mod tests {
     fn hears_a_chapter_and_a_verse() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("chapter four verse nine", false),
+            ear.hear("chapter four verse nine", true),
             Some(Command::Passage { book: None, chapter: Some(4), by: 0, verse: Some(9) })
         );
     }
@@ -716,7 +699,7 @@ mod tests {
     fn hears_a_verse_on_its_own() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("verse sixteen", false),
+            ear.hear("verse sixteen", true),
             Some(Command::Passage { book: None, chapter: None, by: 0, verse: Some(16) })
         );
     }
@@ -726,7 +709,7 @@ mod tests {
     fn a_wake_word_still_takes_a_passage_mid_sentence() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("castavox chapter four verse nine please", false),
+            ear.hear("castavox chapter four verse nine please", true),
             Some(Command::Passage { book: None, chapter: Some(4), by: 0, verse: Some(9) })
         );
     }
@@ -744,7 +727,7 @@ mod tests {
             "the previous chapter ends with a question",
             "verse sixteen is the one everybody knows",
         ] {
-            assert_eq!(ear.hear(said, false), None, "{said}");
+            assert_eq!(ear.hear(said, true), None, "{said}");
         }
     }
 
@@ -752,18 +735,24 @@ mod tests {
     #[test]
     fn a_chapter_with_no_number_asks_for_nothing() {
         let mut ear = listener();
-        assert_eq!(ear.hear("chapter", false), None);
-        assert_eq!(ear.hear("castavox chapter", false), None);
+        assert_eq!(ear.hear("chapter", true), None);
+        assert_eq!(ear.hear("castavox chapter", true), None);
     }
 
-    /// Two different chapters asked for in a row are two instructions; the
-    /// same one twice while the sentence settles is one.
+    /// Each finished sentence is its own instruction, whether or not it says
+    /// the same thing as the last -- an operator moving two chapters says
+    /// "next chapter" twice, and means it twice.
     #[test]
-    fn a_different_chapter_is_a_different_instruction() {
+    fn each_finished_sentence_is_its_own_instruction() {
         let mut ear = listener();
-        assert_eq!(ear.hear("chapter four", false), Some(Command::Passage { book: None, chapter: Some(4), by: 0, verse: None }));
-        assert_eq!(ear.hear("chapter four", false), None);
-        assert_eq!(ear.hear("chapter five", false), Some(Command::Passage { book: None, chapter: Some(5), by: 0, verse: None }));
+        for chapter in [4, 4, 5] {
+            let said = if chapter == 5 { "chapter five" } else { "chapter four" };
+            assert_eq!(
+                ear.hear(said, true),
+                Some(Command::Passage { book: None, chapter: Some(chapter), by: 0, verse: None }),
+                "{said}"
+            );
+        }
     }
 
     /// The trailing words of a longer number belong to it. Without counting
@@ -773,7 +762,7 @@ mod tests {
     fn a_long_number_is_still_the_whole_instruction() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("chapter one hundred nineteen", false),
+            ear.hear("chapter one hundred nineteen", true),
             Some(Command::Passage { book: None, chapter: Some(119), by: 0, verse: None })
         );
     }
@@ -783,12 +772,12 @@ mod tests {
     fn hears_a_chapter_step_with_a_verse() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("next chapter verse nine", false),
+            ear.hear("next chapter verse nine", true),
             Some(Command::Passage { book: None, chapter: None, by: 1, verse: Some(9) })
         );
         ear.forget();
         assert_eq!(
-            ear.hear("previous chapter verse two", false),
+            ear.hear("previous chapter verse two", true),
             Some(Command::Passage { book: None, chapter: None, by: -1, verse: Some(2) })
         );
     }
@@ -800,7 +789,7 @@ mod tests {
         for said in ["John nine eight", "John nine verse eight", "John chapter nine verse eight"] {
             let mut ear = listener();
             assert_eq!(
-                ear.hear(said, false),
+                ear.hear(said, true),
                 Some(Command::Passage {
                     book: Some("John".into()),
                     chapter: Some(9),
@@ -817,7 +806,7 @@ mod tests {
     fn hears_a_book_and_chapter() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("Romans eight", false),
+            ear.hear("Romans eight", true),
             Some(Command::Passage {
                 book: Some("Romans".into()),
                 chapter: Some(8),
@@ -834,7 +823,7 @@ mod tests {
         for said in ["first John four eight", "one john four eight"] {
             let mut ear = listener();
             assert_eq!(
-                ear.hear(said, false),
+                ear.hear(said, true),
                 Some(Command::Passage {
                     book: Some("1 John".into()),
                     chapter: Some(4),
@@ -851,7 +840,7 @@ mod tests {
     fn a_longer_book_name_wins() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("song of solomon two one", false),
+            ear.hear("song of solomon two one", true),
             Some(Command::Passage {
                 book: Some("Song of Solomon".into()),
                 chapter: Some(2),
@@ -865,8 +854,8 @@ mod tests {
     #[test]
     fn a_book_on_its_own_asks_for_nothing() {
         let mut ear = listener();
-        assert_eq!(ear.hear("John", false), None);
-        assert_eq!(ear.hear("the book of Romans", false), None);
+        assert_eq!(ear.hear("John", true), None);
+        assert_eq!(ear.hear("the book of Romans", true), None);
     }
 
     /// And a reference inside a sentence is preaching, not an instruction.
@@ -881,7 +870,7 @@ mod tests {
             "John nine eight is where we finished last week",
             "look at first John four eight with me",
         ] {
-            assert_eq!(ear.hear(said, false), None, "{said}");
+            assert_eq!(ear.hear(said, true), None, "{said}");
         }
     }
 
@@ -891,7 +880,7 @@ mod tests {
     fn a_wake_word_takes_a_reference_mid_sentence() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("castavox John nine eight please", false),
+            ear.hear("castavox John nine eight please", true),
             Some(Command::Passage {
                 book: Some("John".into()),
                 chapter: Some(9),
@@ -901,13 +890,43 @@ mod tests {
         );
     }
 
+    /// A sentence still being revised is not an instruction yet.
+    ///
+    /// This is the guard that stopped "next chapter verse nine" moving two
+    /// chapters. "Next chapter" is a complete and correct instruction, and two
+    /// words later it is a different and more correct one -- so acting on the
+    /// first and then the second moved twice for one thing said once.
+    #[test]
+    fn a_sentence_still_being_revised_is_not_acted_on() {
+        let mut ear = listener();
+        assert_eq!(ear.hear("next", false), None);
+        assert_eq!(ear.hear("next chapter", false), None);
+        assert_eq!(ear.hear("next chapter verse", false), None);
+        assert_eq!(
+            ear.hear("next chapter verse nine", true),
+            Some(Command::Passage { book: None, chapter: None, by: 1, verse: Some(9) })
+        );
+    }
+
+    /// The same trap with a translation: the shorter name is a valid
+    /// instruction on the way to the longer one.
+    #[test]
+    fn a_longer_translation_name_is_not_two_instructions() {
+        let mut ear = listener();
+        assert_eq!(ear.hear("switch to the king james", false), None);
+        assert_eq!(
+            ear.hear("switch to the new king james", true),
+            Some(Command::Switch { translation: "NKJV".into() })
+        );
+    }
+
     /// Said again on purpose, after something else, is a second instruction.
     #[test]
     fn the_same_words_later_are_heard_again() {
         let mut ear = listener();
-        assert_eq!(ear.hear("castavox next verse", false), Some(Command::NextVerse));
-        assert_eq!(ear.hear("castavox clear the screen", false), Some(Command::Clear));
-        assert_eq!(ear.hear("castavox next verse", false), Some(Command::NextVerse));
+        assert_eq!(ear.hear("castavox next verse", true), Some(Command::NextVerse));
+        assert_eq!(ear.hear("castavox clear the screen", true), Some(Command::Clear));
+        assert_eq!(ear.hear("castavox next verse", true), Some(Command::NextVerse));
     }
 
     /// A phrase that has scrolled away is not an instruction any more.
@@ -916,7 +935,7 @@ mod tests {
         let mut ear = listener();
         let long = "castavox next verse ".to_string()
             + &"and then he said to them all of this and much more besides ".repeat(2);
-        assert_eq!(ear.hear(&long, false), None);
+        assert_eq!(ear.hear(&long, true), None);
     }
 
     #[test]
@@ -928,7 +947,7 @@ mod tests {
         ] {
             let mut ear = listener();
             assert_eq!(
-                ear.hear(said, false),
+                ear.hear(said, true),
                 Some(Command::Switch { translation: "ESV".into() }),
                 "{said}"
             );
@@ -942,7 +961,7 @@ mod tests {
     fn the_longer_name_wins() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("castavox switch to the new king james", false),
+            ear.hear("castavox switch to the new king james", true),
             Some(Command::Switch { translation: "NKJV".into() })
         );
     }
@@ -951,7 +970,7 @@ mod tests {
     fn a_church_can_teach_it_their_own_words() {
         let custom = vec![Phrase { said: "shema".into(), does: Command::NextVerse }];
         let mut ear = Listener::new("Castavox", &translations(), &books(), &custom);
-        assert_eq!(ear.hear("castavox shema", false), Some(Command::NextVerse));
+        assert_eq!(ear.hear("castavox shema", true), Some(Command::NextVerse));
     }
 
     /// Their words beat ours where both would match, because they added theirs
@@ -960,7 +979,7 @@ mod tests {
     fn a_churchs_own_phrase_wins() {
         let custom = vec![Phrase { said: "next verse".into(), does: Command::Clear }];
         let mut ear = Listener::new("Castavox", &translations(), &books(), &custom);
-        assert_eq!(ear.hear("castavox next verse", false), Some(Command::Clear));
+        assert_eq!(ear.hear("castavox next verse", true), Some(Command::Clear));
     }
 
     /// The second instruction, not the first: an operator who corrects
@@ -969,7 +988,7 @@ mod tests {
     fn the_last_wake_word_is_the_one_that_counts() {
         let mut ear = listener();
         assert_eq!(
-            ear.hear("castavox next verse castavox clear the screen", false),
+            ear.hear("castavox next verse castavox clear the screen", true),
             Some(Command::Clear)
         );
     }
@@ -982,14 +1001,14 @@ mod tests {
     #[test]
     fn without_a_wake_word_a_bare_instruction_still_works() {
         let mut ear = Listener::new("", &translations(), &books(), &[]);
-        assert_eq!(ear.hear("next verse", false), Some(Command::NextVerse));
+        assert_eq!(ear.hear("next verse", true), Some(Command::NextVerse));
         ear.forget();
-        assert_eq!(ear.hear("previous verse", false), Some(Command::PreviousVerse));
+        assert_eq!(ear.hear("previous verse", true), Some(Command::PreviousVerse));
         ear.forget();
-        assert_eq!(ear.hear("clear the screen", false), Some(Command::Clear));
+        assert_eq!(ear.hear("clear the screen", true), Some(Command::Clear));
         ear.forget();
         assert_eq!(
-            ear.hear("give me the King James", false),
+            ear.hear("give me the King James", true),
             Some(Command::Switch { translation: "KJV".into() })
         );
     }
@@ -1009,7 +1028,7 @@ mod tests {
             "he read the next verse and then stopped",
             "we will come back to that",
         ] {
-            assert_eq!(ear.hear(said, false), None, "{said}");
+            assert_eq!(ear.hear(said, true), None, "{said}");
         }
     }
 
@@ -1019,12 +1038,12 @@ mod tests {
     #[test]
     fn a_wake_word_does_not_stop_a_bare_instruction() {
         let mut ear = listener();
-        assert_eq!(ear.hear("next verse", false), Some(Command::NextVerse));
+        assert_eq!(ear.hear("next verse", true), Some(Command::NextVerse));
         ear.forget();
-        assert_eq!(ear.hear("castavox next verse", false), Some(Command::NextVerse));
+        assert_eq!(ear.hear("castavox next verse", true), Some(Command::NextVerse));
         ear.forget();
         assert_eq!(
-            ear.hear("give me the King James", false),
+            ear.hear("give me the King James", true),
             Some(Command::Switch { translation: "KJV".into() })
         );
     }
@@ -1038,7 +1057,7 @@ mod tests {
             "the King James is clearer here",
             "we will come back to that",
         ] {
-            assert_eq!(ear.hear(said, false), None, "{said}");
+            assert_eq!(ear.hear(said, true), None, "{said}");
         }
     }
 
@@ -1046,15 +1065,15 @@ mod tests {
     fn a_bare_custom_phrase_works() {
         let custom = vec![Phrase { said: "shema".into(), does: Command::NextVerse }];
         let mut ear = Listener::new("", &translations(), &books(), &custom);
-        assert_eq!(ear.hear("shema", false), Some(Command::NextVerse));
+        assert_eq!(ear.hear("shema", true), Some(Command::NextVerse));
         ear.forget();
-        assert_eq!(ear.hear("and then he said shema to them", false), None);
+        assert_eq!(ear.hear("and then he said shema to them", true), None);
     }
 
     /// The wake word alone is somebody saying the product's name.
     #[test]
     fn the_wake_word_on_its_own_asks_for_nothing() {
         let mut ear = listener();
-        assert_eq!(ear.hear("we run this on castavox", false), None);
+        assert_eq!(ear.hear("we run this on castavox", true), None);
     }
 }
