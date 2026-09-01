@@ -36,6 +36,27 @@ pub fn word_value(token: &str) -> Option<i64> {
         .map(|(_, value)| *value)
 }
 
+/// The first number in `tokens`, and how many words it took.
+///
+/// `read_numbers` says what the numbers are; this says where the first one
+/// ends, which is what anything reading "John nine eight" needs -- the words
+/// are two numbers, and consuming every number word in a row would swallow the
+/// verse into the chapter.
+pub fn read_first(tokens: &[String]) -> Option<(i64, usize)> {
+    let first = *read_numbers(tokens).first()?;
+
+    // The shortest run of words that reads as the whole first number. Asking
+    // `read_numbers` itself rather than reimplementing when a ten absorbs a
+    // unit, so the two cannot disagree -- and disagreeing is the failure that
+    // matters, because it would silently swallow a verse into its chapter.
+    for used in 1..=tokens.len() {
+        if read_numbers(&tokens[..used]) == [first] {
+            return Some((first, used));
+        }
+    }
+    None
+}
+
 /// Collapses a run of number words into the numbers they name.
 ///
 /// "twenty eight" is one number; "three sixteen" is two. The difference is
@@ -112,6 +133,20 @@ mod tests {
     fn tens_compose_and_separate_numbers_do_not() {
         assert_eq!(read("twenty eight"), [28]);
         assert_eq!(read("three sixteen"), [3, 16]);
+    }
+
+    /// Where one number ends and the next begins, which is the whole reason
+    /// "John nine eight" can be read as a chapter and a verse.
+    #[test]
+    fn the_first_number_knows_where_it_ends() {
+        let words = |t: &str| t.split(' ').map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(read_first(&words("nine eight")), Some((9, 1)));
+        assert_eq!(read_first(&words("twenty eight")), Some((28, 2)));
+        assert_eq!(read_first(&words("one hundred nineteen")), Some((119, 3)));
+        assert_eq!(read_first(&words("nine")), Some((9, 1)));
+        assert_eq!(read_first(&words("chapter")), None);
+        // The words after a number are not part of it, however many there are.
+        assert_eq!(read_first(&words("eight is where we finished")), Some((8, 1)));
     }
 
     #[test]

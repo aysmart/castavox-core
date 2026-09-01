@@ -92,13 +92,29 @@ pub enum Command {
      * detected list; a command that also jumped the browser would be two things
      * happening for one sentence. These move within what is already open.
      */
-    NextChapter,
-    PreviousChapter,
-    /// "chapter four" -- that chapter of the book being read.
-    Chapter { chapter: i64 },
-    /// "chapter four verse nine" -- and "verse nine" on its own, which keeps
-    /// the chapter.
-    Passage { chapter: Option<i64>, verse: i64 },
+    /**
+     * Somewhere else in the scripture: a chapter, a verse, or a whole
+     * reference.
+     *
+     * One shape rather than four, because every way of saying it is the same
+     * request with different parts left out. "Next chapter" is a relative move
+     * with no verse; "chapter four verse nine" is an absolute one with both;
+     * "John nine eight" adds the book. Four commands meant four dispatches in
+     * each product and four chances for one of them to be wrong.
+     *
+     * `book` is the library's own spelling, resolved here, so the products
+     * never have to match a spoken name themselves.
+     */
+    Passage {
+        /// Named only when the operator said one; otherwise the book being read.
+        book: Option<String>,
+        /// An absolute chapter, when one was named.
+        chapter: Option<i64>,
+        /// A relative move: 1 for "next chapter", -1 for "previous".
+        by: i64,
+        /// Absent means the top of the chapter.
+        verse: Option<i64>,
+    }
 }
 
 /// A phrase a church has taught the application, pointed at an action.
@@ -115,10 +131,6 @@ pub struct Phrase {
 /// Ordered longest first where two overlap, because "previous verse" contains
 /// "verse" and the longer reading is the one that was meant.
 const BUILT_IN: &[(&str, Command)] = &[
-    ("previous chapter", Command::PreviousChapter),
-    ("last chapter", Command::PreviousChapter),
-    ("chapter back", Command::PreviousChapter),
-    ("next chapter", Command::NextChapter),
     ("previous verse", Command::PreviousVerse),
     ("verse back", Command::PreviousVerse),
     ("go back", Command::PreviousVerse),
@@ -137,6 +149,10 @@ pub struct Listener {
     wake: String,
     /// Translations by every name a person might say them by.
     named: Vec<(String, String)>,
+    /// Book names as spoken, paired with the library's own spelling. Longest
+    /// first, so "song of solomon" is not read as a song and "1 john" beats
+    /// "john".
+    books: Vec<(String, String)>,
     custom: Vec<Phrase>,
     /// The last thing acted on, so one instruction is obeyed once.
     last: Option<String>,
@@ -184,6 +200,25 @@ fn strip(tail: &[String]) -> String {
         .join(" ")
 }
 
+/// The ways a book's name is actually said.
+///
+/// "1 John" is "first john" as often as "one john", and a recogniser writes
+/// whichever it heard. Everything else is itself.
+fn spoken_forms(book: &str) -> Vec<String> {
+    let folded = words(book).join(" ");
+    let mut forms = vec![folded.clone()];
+
+    for (digit, spoken) in [("1", ["first", "one"]), ("2", ["second", "two"]), ("3", ["third", "three"])]
+    {
+        if let Some(rest) = folded.strip_prefix(&format!("{digit} ")) {
+            for word in spoken {
+                forms.push(format!("{word} {rest}"));
+            }
+        }
+    }
+    forms
+}
+
 /// Whether `haystack` contains `needle` as whole words.
 ///
 /// Both are already folded to single-spaced lower-case words, so this is a
@@ -203,7 +238,12 @@ fn contains_words(haystack: &str, needle: &str) -> bool {
 
 impl Listener {
     /// `translations` is `(id, name)` — "ESV", "English Standard Version".
-    pub fn new(wake: &str, translations: &[(String, String)], custom: &[Phrase]) -> Self {
+    pub fn new(
+        wake: &str,
+        translations: &[(String, String)],
+        books: &[String],
+        custom: &[Phrase],
+    ) -> Self {
         let mut named = Vec::new();
         for (id, name) in translations {
             // The code, said as a word: "switch to ESV".
@@ -221,9 +261,22 @@ impl Listener {
         named.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
         named.dedup_by(|a, b| a.0 == b.0);
 
+        // Spoken form against the library's spelling: "1 john" is said as
+        // "first john" as often as not, and the ordinal readings are how the
+        // reference matcher already copes with that.
+        let mut spoken: Vec<(String, String)> = Vec::new();
+        for book in books {
+            for form in spoken_forms(book) {
+                spoken.push((form, book.clone()));
+            }
+        }
+        spoken.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        spoken.dedup_by(|a, b| a.0 == b.0);
+
         Self {
             wake: words(wake).join(" "),
             named,
+            books: spoken,
             custom: custom.to_vec(),
             last: None,
         }
@@ -344,9 +397,13 @@ impl Listener {
         // "chapter four" is an operator, "in chapter four Paul writes" is not.
         // Measured by words consumed, because the words asking and the words
         // returned as a key are deliberately not the same thing.
+        // The whole utterance has to be the instruction. Nothing else is
+        // needed to tell it from speech: "in chapter four Paul writes" has
+        // words left over, and so does every sentence that merely mentions a
+        // reference.
         let spoken: Vec<String> = said.split(' ').map(str::to_string).collect();
-        if let Some((command, key, consumed)) = Self::match_passage(&spoken) {
-            if consumed == spoken.len() && spoken.first().is_some_and(|w| w == "chapter" || w == "verse") {
+        if let Some((command, key, consumed)) = self.match_passage(&spoken) {
+            if consumed == spoken.len() {
                 return Some((command, key));
             }
         }
@@ -359,67 +416,104 @@ impl Listener {
         None
     }
 
-    /// "chapter four", "chapter four verse nine", "verse nine".
-    ///
-    /// Read after the fixed phrases and before translation names, because a
-    /// number is the least ambiguous thing anybody says: "chapter" followed by
-    /// one is not a sentence that happens by accident.
-    ///
-    /// Numbers are read as they are spoken -- "chapter twenty eight" is one
-    /// chapter, not chapter twenty and an eight -- by the same reader that
-    /// interprets a spoken reference.
-    ///
-    /// Returns how many words the instruction actually used, which is what
-    /// lets the caller tell "chapter four" said on its own from the same words
-    /// inside a sentence. Counting them rather than slicing a fixed number is
-    /// the point: a number can be several words long.
-    fn match_passage(words: &[String]) -> Option<(Command, String, usize)> {
-        let chapter_at = words.iter().position(|word| word == "chapter");
-        let verse_at = words.iter().position(|word| word == "verse");
-        if chapter_at.is_none() && verse_at.is_none() {
+    /**
+     * Everywhere in the scripture somebody might ask to be taken.
+     *
+     * "Next chapter", "next chapter verse nine", "chapter four", "chapter four
+     * verse nine", "verse nine", "John nine eight", "John nine verse eight",
+     * "John chapter nine verse eight".
+     *
+     * All one matcher because they are all the same request with different
+     * parts named. Read in the order a person says them: the book, then the
+     * chapter, then the verse.
+     *
+     * Returns how many words the instruction used, which is what tells
+     * "chapter four" said on its own from the same words inside a sentence. A
+     * number can be several words long, so it is counted rather than assumed.
+     */
+    fn match_passage(&self, words: &[String]) -> Option<(Command, String, usize)> {
+        let mut at = 0;
+
+        // The book, if one was named. Longest first, so "song of solomon" is
+        // not read as a song, and "1 john" beats "john".
+        let mut book = None;
+        for name in &self.books {
+            let spelling: Vec<&str> = name.0.split(' ').collect();
+            if words.len() >= spelling.len()
+                && words[..spelling.len()].iter().zip(&spelling).all(|(a, b)| a == b)
+            {
+                book = Some(name.1.clone());
+                at = spelling.len();
+                break;
+            }
+        }
+
+        // A relative move. "Next chapter" and, after a book, nothing: "John
+        // next chapter" is not something anybody says.
+        let mut by = 0;
+        if book.is_none() && at + 1 < words.len() && words[at + 1] == "chapter" {
+            by = match words[at].as_str() {
+                "next" => 1,
+                "previous" | "last" => -1,
+                _ => 0,
+            };
+            if by != 0 {
+                at += 2;
+            }
+        }
+
+        // "chapter" is optional once a book has been named: "John nine eight"
+        // and "John chapter nine verse eight" are the same request.
+        let mut chapter = None;
+        if by == 0 {
+            if words.get(at).is_some_and(|word| word == "chapter") {
+                at += 1;
+                let (value, used) = Self::number(words, at)?;
+                chapter = Some(value);
+                at = used;
+            } else if book.is_some() {
+                let (value, used) = Self::number(words, at)?;
+                chapter = Some(value);
+                at = used;
+            }
+        }
+
+        // The verse, spoken with or without the word.
+        let mut verse = None;
+        if words.get(at).is_some_and(|word| word == "verse") {
+            at += 1;
+            let (value, used) = Self::number(words, at)?;
+            verse = Some(value);
+            at = used;
+        } else if book.is_some() && at < words.len() {
+            // "John nine eight": the second number is the verse.
+            if let Some((value, used)) = Self::number(words, at) {
+                verse = Some(value);
+                at = used;
+            }
+        }
+
+        // A book with no numbers is somebody saying a name, and "chapter" with
+        // no number is somebody talking about one.
+        if chapter.is_none() && verse.is_none() && by == 0 {
             return None;
         }
 
-        // Only the numbers that follow the word they belong to, so "verse nine"
-        // inside "chapter four verse nine" is not read as the chapter. Returns
-        // the value and where its words ended.
-        let after = |at: Option<usize>, stop: Option<usize>| -> Option<(i64, usize)> {
-            let start = at? + 1;
-            let end = stop.filter(|s| *s > start).unwrap_or(words.len());
-            let slice = words.get(start..end)?;
-            let value = *crate::numbers::read_numbers(slice).first()?;
-
-            // How far the number ran. Anything that reads as part of a number
-            // belongs to it; the first word that does not ends the phrase.
-            let mut used = start;
-            while used < end && crate::numbers::word_value(&words[used]).is_some()
-                || (used < end && words[used] == "hundred")
-            {
-                used += 1;
-            }
-            Some((value, used))
-        };
-
-        let chapter = after(chapter_at, verse_at);
-        let verse = after(verse_at, None);
-
-        let consumed = verse.map(|(_, at)| at).or(chapter.map(|(_, at)| at))?;
-
         // Keyed on what was asked for rather than on the words that asked, so
-        // the same instruction phrased twice is one instruction and a different
+        // the same request phrased twice is one instruction and a different
         // chapter is a different one.
-        match (chapter.map(|(v, _)| v), verse.map(|(v, _)| v)) {
-            (chapter, Some(verse)) => Some((
-                Command::Passage { chapter, verse },
-                format!("passage {chapter:?} {verse}"),
-                consumed,
-            )),
-            (Some(chapter), None) => {
-                Some((Command::Chapter { chapter }, format!("chapter {chapter}"), consumed))
-            }
-            // "chapter" with no number is somebody talking about a chapter.
-            (None, None) => None,
-        }
+        let key = format!("passage {book:?} {chapter:?} {by} {verse:?}");
+        Some((Command::Passage { book, chapter, by, verse }, key, at))
+    }
+
+    /// One number starting at `at`, and where its words ended.
+    ///
+    /// A number can be several words long -- "one hundred nineteen" -- and
+    /// knowing where it stopped is what lets the caller tell a complete
+    /// instruction from words inside a sentence.
+    fn number(words: &[String], at: usize) -> Option<(i64, usize)> {
+        let (value, used) = crate::numbers::read_first(words.get(at..)?)?;
+        Some((value, at + used))
     }
 
     /// The command, and the phrase that matched — which is what identifies the
@@ -440,7 +534,7 @@ impl Listener {
         }
 
         let spoken: Vec<String> = said.split(' ').map(str::to_string).collect();
-        if let Some((command, key, _)) = Self::match_passage(&spoken) {
+        if let Some((command, key, _)) = self.match_passage(&spoken) {
             return Some((command, key));
         }
 
@@ -476,8 +570,15 @@ mod tests {
         .collect()
     }
 
+    fn books() -> Vec<String> {
+        ["Genesis", "John", "1 John", "Psalms", "Song of Solomon", "Romans", "Jude"]
+            .iter()
+            .map(|book| book.to_string())
+            .collect()
+    }
+
     fn listener() -> Listener {
-        Listener::new("Castavox", &translations(), &[])
+        Listener::new("Castavox", &translations(), &books(), &[])
     }
 
     #[test]
@@ -527,7 +628,7 @@ mod tests {
     /// not be woken by every word that happens to start with it.
     #[test]
     fn the_wake_word_is_not_matched_inside_another_word() {
-        let mut ear = Listener::new("bee", &translations(), &[]);
+        let mut ear = Listener::new("bee", &translations(), &books(), &[]);
         assert_eq!(ear.hear("the beef next verse", false), None);
         assert_eq!(ear.hear("bee next verse", false), Some(Command::NextVerse));
     }
@@ -573,11 +674,11 @@ mod tests {
     #[test]
     fn hears_a_chapter_moved_by_one() {
         let mut ear = listener();
-        assert_eq!(ear.hear("next chapter", false), Some(Command::NextChapter));
+        assert_eq!(ear.hear("next chapter", false), Some(Command::Passage { book: None, chapter: None, by: 1, verse: None }));
         ear.forget();
-        assert_eq!(ear.hear("previous chapter", false), Some(Command::PreviousChapter));
+        assert_eq!(ear.hear("previous chapter", false), Some(Command::Passage { book: None, chapter: None, by: -1, verse: None }));
         ear.forget();
-        assert_eq!(ear.hear("castavox last chapter", false), Some(Command::PreviousChapter));
+        assert_eq!(ear.hear("castavox last chapter", false), Some(Command::Passage { book: None, chapter: None, by: -1, verse: None }));
     }
 
     /// "Chapter four", however the recogniser wrote the number.
@@ -585,7 +686,7 @@ mod tests {
     fn hears_a_chapter_by_number() {
         for said in ["chapter four", "chapter 4"] {
             let mut ear = listener();
-            assert_eq!(ear.hear(said, false), Some(Command::Chapter { chapter: 4 }), "{said}");
+            assert_eq!(ear.hear(said, false), Some(Command::Passage { book: None, chapter: Some(4), by: 0, verse: None }), "{said}");
         }
     }
 
@@ -596,7 +697,7 @@ mod tests {
         let mut ear = listener();
         assert_eq!(
             ear.hear("chapter twenty eight", false),
-            Some(Command::Chapter { chapter: 28 })
+            Some(Command::Passage { book: None, chapter: Some(28), by: 0, verse: None })
         );
     }
 
@@ -605,7 +706,7 @@ mod tests {
         let mut ear = listener();
         assert_eq!(
             ear.hear("chapter four verse nine", false),
-            Some(Command::Passage { chapter: Some(4), verse: 9 })
+            Some(Command::Passage { book: None, chapter: Some(4), by: 0, verse: Some(9) })
         );
     }
 
@@ -616,7 +717,7 @@ mod tests {
         let mut ear = listener();
         assert_eq!(
             ear.hear("verse sixteen", false),
-            Some(Command::Passage { chapter: None, verse: 16 })
+            Some(Command::Passage { book: None, chapter: None, by: 0, verse: Some(16) })
         );
     }
 
@@ -626,7 +727,7 @@ mod tests {
         let mut ear = listener();
         assert_eq!(
             ear.hear("castavox chapter four verse nine please", false),
-            Some(Command::Passage { chapter: Some(4), verse: 9 })
+            Some(Command::Passage { book: None, chapter: Some(4), by: 0, verse: Some(9) })
         );
     }
 
@@ -660,9 +761,9 @@ mod tests {
     #[test]
     fn a_different_chapter_is_a_different_instruction() {
         let mut ear = listener();
-        assert_eq!(ear.hear("chapter four", false), Some(Command::Chapter { chapter: 4 }));
+        assert_eq!(ear.hear("chapter four", false), Some(Command::Passage { book: None, chapter: Some(4), by: 0, verse: None }));
         assert_eq!(ear.hear("chapter four", false), None);
-        assert_eq!(ear.hear("chapter five", false), Some(Command::Chapter { chapter: 5 }));
+        assert_eq!(ear.hear("chapter five", false), Some(Command::Passage { book: None, chapter: Some(5), by: 0, verse: None }));
     }
 
     /// The trailing words of a longer number belong to it. Without counting
@@ -673,7 +774,130 @@ mod tests {
         let mut ear = listener();
         assert_eq!(
             ear.hear("chapter one hundred nineteen", false),
-            Some(Command::Chapter { chapter: 119 })
+            Some(Command::Passage { book: None, chapter: Some(119), by: 0, verse: None })
+        );
+    }
+
+    /// A chapter step that also names a verse.
+    #[test]
+    fn hears_a_chapter_step_with_a_verse() {
+        let mut ear = listener();
+        assert_eq!(
+            ear.hear("next chapter verse nine", false),
+            Some(Command::Passage { book: None, chapter: None, by: 1, verse: Some(9) })
+        );
+        ear.forget();
+        assert_eq!(
+            ear.hear("previous chapter verse two", false),
+            Some(Command::Passage { book: None, chapter: None, by: -1, verse: Some(2) })
+        );
+    }
+
+    /// A reference as it is actually said from a pulpit, in each of its
+    /// shapes. All three mean John 9:8.
+    #[test]
+    fn hears_a_reference_however_it_is_said() {
+        for said in ["John nine eight", "John nine verse eight", "John chapter nine verse eight"] {
+            let mut ear = listener();
+            assert_eq!(
+                ear.hear(said, false),
+                Some(Command::Passage {
+                    book: Some("John".into()),
+                    chapter: Some(9),
+                    by: 0,
+                    verse: Some(8),
+                }),
+                "{said}"
+            );
+        }
+    }
+
+    /// A book and a chapter with no verse is the top of that chapter.
+    #[test]
+    fn hears_a_book_and_chapter() {
+        let mut ear = listener();
+        assert_eq!(
+            ear.hear("Romans eight", false),
+            Some(Command::Passage {
+                book: Some("Romans".into()),
+                chapter: Some(8),
+                by: 0,
+                verse: None,
+            })
+        );
+    }
+
+    /// Numbered books, said as people say them. "First John" and "one john"
+    /// are both the book a recogniser may have written either way.
+    #[test]
+    fn hears_a_numbered_book_spoken() {
+        for said in ["first John four eight", "one john four eight"] {
+            let mut ear = listener();
+            assert_eq!(
+                ear.hear(said, false),
+                Some(Command::Passage {
+                    book: Some("1 John".into()),
+                    chapter: Some(4),
+                    by: 0,
+                    verse: Some(8),
+                }),
+                "{said}"
+            );
+        }
+    }
+
+    /// The longest book name wins, so "1 John" is not read as "John".
+    #[test]
+    fn a_longer_book_name_wins() {
+        let mut ear = listener();
+        assert_eq!(
+            ear.hear("song of solomon two one", false),
+            Some(Command::Passage {
+                book: Some("Song of Solomon".into()),
+                chapter: Some(2),
+                by: 0,
+                verse: Some(1),
+            })
+        );
+    }
+
+    /// A book named with no number is a preacher saying a name.
+    #[test]
+    fn a_book_on_its_own_asks_for_nothing() {
+        let mut ear = listener();
+        assert_eq!(ear.hear("John", false), None);
+        assert_eq!(ear.hear("the book of Romans", false), None);
+    }
+
+    /// And a reference inside a sentence is preaching, not an instruction.
+    /// This is the case that matters most: references are said aloud in every
+    /// service, far more often than any other phrase here.
+    #[test]
+    fn a_reference_in_a_sentence_is_not_a_command() {
+        let mut ear = listener();
+        for said in [
+            "turn with me to John nine eight",
+            "as we read in Romans eight this morning",
+            "John nine eight is where we finished last week",
+            "look at first John four eight with me",
+        ] {
+            assert_eq!(ear.hear(said, false), None, "{said}");
+        }
+    }
+
+    /// The wake word buys the usual latitude, because nobody says it by
+    /// accident.
+    #[test]
+    fn a_wake_word_takes_a_reference_mid_sentence() {
+        let mut ear = listener();
+        assert_eq!(
+            ear.hear("castavox John nine eight please", false),
+            Some(Command::Passage {
+                book: Some("John".into()),
+                chapter: Some(9),
+                by: 0,
+                verse: Some(8),
+            })
         );
     }
 
@@ -726,7 +950,7 @@ mod tests {
     #[test]
     fn a_church_can_teach_it_their_own_words() {
         let custom = vec![Phrase { said: "shema".into(), does: Command::NextVerse }];
-        let mut ear = Listener::new("Castavox", &translations(), &custom);
+        let mut ear = Listener::new("Castavox", &translations(), &books(), &custom);
         assert_eq!(ear.hear("castavox shema", false), Some(Command::NextVerse));
     }
 
@@ -735,7 +959,7 @@ mod tests {
     #[test]
     fn a_churchs_own_phrase_wins() {
         let custom = vec![Phrase { said: "next verse".into(), does: Command::Clear }];
-        let mut ear = Listener::new("Castavox", &translations(), &custom);
+        let mut ear = Listener::new("Castavox", &translations(), &books(), &custom);
         assert_eq!(ear.hear("castavox next verse", false), Some(Command::Clear));
     }
 
@@ -757,7 +981,7 @@ mod tests {
     /// standing alone.
     #[test]
     fn without_a_wake_word_a_bare_instruction_still_works() {
-        let mut ear = Listener::new("", &translations(), &[]);
+        let mut ear = Listener::new("", &translations(), &books(), &[]);
         assert_eq!(ear.hear("next verse", false), Some(Command::NextVerse));
         ear.forget();
         assert_eq!(ear.hear("previous verse", false), Some(Command::PreviousVerse));
@@ -775,7 +999,7 @@ mod tests {
     /// instruction, however exactly the words match.
     #[test]
     fn without_a_wake_word_a_sermon_is_still_not_a_command() {
-        let mut ear = Listener::new("", &translations(), &[]);
+        let mut ear = Listener::new("", &translations(), &books(), &[]);
         for said in [
             "and the next verse says something remarkable",
             "let us go back to what Paul wrote",
@@ -821,7 +1045,7 @@ mod tests {
     #[test]
     fn a_bare_custom_phrase_works() {
         let custom = vec![Phrase { said: "shema".into(), does: Command::NextVerse }];
-        let mut ear = Listener::new("", &translations(), &custom);
+        let mut ear = Listener::new("", &translations(), &books(), &custom);
         assert_eq!(ear.hear("shema", false), Some(Command::NextVerse));
         ear.forget();
         assert_eq!(ear.hear("and then he said shema to them", false), None);
