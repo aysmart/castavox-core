@@ -237,12 +237,25 @@ pub fn endpoint_url(endpoint: &str, api_version: &str, shape: Shape) -> String {
 /**
  * Whether an endpoint may be plain HTTP.
  *
- * Only for a model on this machine. Ollama answers on `http://localhost:11434`
- * and LM Studio on `http://localhost:1234`, and refusing those would refuse the
- * whole point of running a model locally.
+ * This machine, or the church's own network. Ollama answers on
+ * `http://localhost:11434` and LM Studio on `http://localhost:1234`, and
+ * refusing those would refuse the whole point of running a model locally.
  *
- * Anywhere else it is a key and a sermon in clear across a church network,
- * which is not a thing to allow because somebody typed it.
+ * # Why the network, and not only this machine
+ *
+ * It was loopback alone until a church put LM Studio on the one PC with a
+ * graphics card and ran the desk from a laptop, which is the obvious way to
+ * do it and the arrangement the feature is for. Neither machine has a
+ * certificate, nobody is going to obtain one for a computer in a back room,
+ * and refusing the address means telling that church to buy a subscription
+ * for a model they already own.
+ *
+ * What the church is choosing, and should be told: the transcript crosses
+ * their own wiring unencrypted. That is a real thing to weigh, and it is
+ * theirs to weigh -- it is their building, their network and their sermon.
+ *
+ * The public internet stays refused. There the same request crosses equipment
+ * nobody in the church controls, and no amount of typing makes that all right.
  */
 pub fn transport_is_safe(endpoint: &str) -> bool {
     let endpoint = endpoint.trim();
@@ -251,8 +264,48 @@ pub fn transport_is_safe(endpoint: &str) -> bool {
     }
     let Some(rest) = endpoint.strip_prefix("http://") else { return false };
     let host = rest.split('/').next().unwrap_or_default();
-    let host = host.split(':').next().unwrap_or_default();
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+    // An IPv6 literal is bracketed, and its own colons are not the port's.
+    let host = match host.strip_prefix('[') {
+        Some(inside) => inside.split(']').next().unwrap_or_default(),
+        None => host.split(':').next().unwrap_or_default(),
+    };
+    on_this_network(host)
+}
+
+/// Whether a host is this machine or somewhere on the local network.
+///
+/// Names as well as numbers: a church types the PC's name far more readily
+/// than its address, and mDNS (`studio.local`) is how a Mac finds a machine
+/// on the same wire. A bare name with no dots is the same case -- it can only
+/// resolve through the local resolver, so it cannot be a host on the internet.
+///
+/// `localhost.evil.com` must not pass, which is why this matches whole labels
+/// rather than prefixes.
+fn on_this_network(host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    if matches!(host.as_str(), "localhost" | "::1") {
+        return true;
+    }
+    if let Ok(address) = host.parse::<std::net::IpAddr>() {
+        return match address {
+            // `is_private` is the RFC 1918 set; link-local covers a cable
+            // between two machines with no router to hand out addresses.
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_private() || v4.is_link_local()
+            }
+            // fc00::/7 is IPv6's private range; fe80::/10 its link-local one.
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+            }
+        };
+    }
+    // A name. Only ones that cannot leave the building.
+    host.ends_with(".local") || host.ends_with(".localdomain") || !host.contains('.')
 }
 
 /// Whether a refusal was about `response_format` rather than about us.
@@ -334,6 +387,33 @@ pub fn is_intercepted(detail: &str) -> bool {
         || lower.contains("certificate verify failed")
         || lower.contains("self-signed certificate")
         || lower.contains("unable to get local issuer")
+}
+
+/// Whether nothing was listening at the address, as opposed to the network
+/// being at fault.
+///
+/// A refused connection is a machine saying no, not a network failing to
+/// carry the request -- so "check the internet connection" is exactly the
+/// wrong advice, and it is the advice a church got when they pointed the
+/// assistant at LM Studio on a PC and left the address on `localhost`. There
+/// was no internet involved at either end.
+///
+/// A name that will not resolve is the same class of mistake: the address is
+/// wrong, or the machine is not on, and no amount of checking a connection
+/// that is working will show it.
+///
+/// Both spellings of refusal, because Windows words its own (10061) rather
+/// than borrowing the Unix one (61).
+pub fn is_nothing_listening(detail: &str) -> bool {
+    let lower = detail.to_lowercase();
+    lower.contains("connection refused")
+        || lower.contains("actively refused")
+        || lower.contains("os error 61")
+        || lower.contains("os error 10061")
+        || lower.contains("dns error")
+        || lower.contains("failed to lookup address")
+        || lower.contains("nodename nor servname")
+        || lower.contains("name or service not known")
 }
 
 /// Whether the model's safety filter objected to the request.
@@ -883,22 +963,39 @@ mod tests {
         );
     }
 
-    /// Plain HTTP reaches a model on this machine and nothing else. Anywhere
-    /// but loopback it is a key and a sermon in clear across a church network.
+    /// Plain HTTP reaches this machine and the church's own network, and
+    /// nothing beyond it. On the internet the same request crosses equipment
+    /// nobody in the church controls.
     #[test]
-    fn plain_http_is_for_this_machine_only() {
+    fn plain_http_stays_inside_the_building() {
         for allowed in [
             "http://localhost:11434/v1",
             "http://127.0.0.1:1234/v1",
+            "http://[::1]:1234/v1",
+            // The PC with the graphics card, which is the whole reason this
+            // is not loopback-only.
+            "http://192.168.1.50:1234/v1",
+            "http://10.0.0.4:11434/v1",
+            "http://172.16.5.9:1234/v1",
+            // A cable between two machines and no router.
+            "http://169.254.7.3:1234/v1",
+            // Named rather than numbered, which is what people actually type.
+            "http://studio.local:1234/v1",
+            "http://media-pc:1234/v1",
             "https://api.openai.com/v1",
         ] {
             assert!(transport_is_safe(allowed), "{allowed}");
         }
         for refused in [
-            "http://192.168.1.50:11434/v1",
             "http://models.example.com/v1",
+            // Public addresses, including one that merely looks private.
+            "http://8.8.8.8:1234/v1",
+            "http://172.32.0.1:1234/v1",
+            // The classic: a public name wearing a local one as a prefix.
             "http://localhost.evil.com/v1",
+            "http://studio.local.evil.com/v1",
             "ftp://localhost/v1",
+            "http:///v1",
         ] {
             assert!(!transport_is_safe(refused), "{refused}");
         }
