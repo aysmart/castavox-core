@@ -88,15 +88,56 @@ impl std::error::Error for Failure {}
 
 pub type Result<T> = std::result::Result<T, Failure>;
 
+/**
+ * How a service expects to be asked.
+ *
+ * Underneath, every one of them takes a list of messages and returns a message.
+ * What differs is the address, the header the key goes in, and — for one of
+ * them — where the system prompt lives. Three shapes cover everything a church
+ * is likely to have.
+ */
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Shape {
+    /**
+     * `POST {base}/chat/completions`, key as a bearer token.
+     *
+     * The default because most of the industry copied OpenAI's: it reaches
+     * OpenAI itself, DeepSeek, Grok, Mistral, Groq, OpenRouter, Perplexity,
+     * Gemini through its compatibility endpoint, and both of the runners a
+     * church would use on its own machine — Ollama and LM Studio.
+     */
+    #[default]
+    OpenAi,
+    /// The same body at `?api-version=`, key in an `api-key` header. Azure
+    /// OpenAI and AI Foundry.
+    Azure,
+    /**
+     * `POST {base}/v1/messages`, and three differences that are each silent
+     * when wrong.
+     *
+     * The system prompt is its own field rather than a message with
+     * `role: system` — put it in the array and it is ignored. `max_tokens` is
+     * required rather than optional — leave it out and the answer is a 400.
+     * And the reply is `content[0].text` rather than
+     * `choices[0].message.content` — read the wrong one and a good answer looks
+     * like a model with nothing to say.
+     */
+    Anthropic,
+}
+
 /// A church's own deployment.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Deployment {
-    /// e.g. https://my-resource.services.ai.azure.com/models
+    /// e.g. `https://api.openai.com/v1`, or `http://localhost:11434/v1` for a
+    /// model running on the machine itself.
     pub endpoint: String,
-    /// Deployment or model name, e.g. gpt-4o-mini or Llama-3.3-70B-Instruct.
+    /// Deployment or model name, e.g. gpt-4o-mini, deepseek-chat, llama3.1.
     pub model: String,
+    /// Azure only, and ignored by the other two.
     pub api_version: String,
+    pub shape: Shape,
 }
 
 /// Where a completion is sent, and on whose account.
@@ -149,8 +190,20 @@ impl Route<'_> {
 /// Left alone when they have already named a route: `/models` because they read
 /// the documentation, `/openai/deployments/...` because they are pointing at an
 /// Azure OpenAI deployment, which is a different shape entirely.
-pub fn endpoint_url(endpoint: &str, api_version: &str) -> String {
+pub fn endpoint_url(endpoint: &str, api_version: &str, shape: Shape) -> String {
     let base = endpoint.trim().trim_end_matches('/');
+
+    if shape == Shape::Anthropic {
+        // Anthropic names its own version in a header rather than a query, and
+        // its path is not a chat completion.
+        return if base.ends_with("/messages") {
+            base.to_string()
+        } else if base.ends_with("/v1") {
+            format!("{base}/messages")
+        } else {
+            format!("{base}/v1/messages")
+        };
+    }
 
     let foundry = base
         .split("://")
@@ -166,12 +219,40 @@ pub fn endpoint_url(endpoint: &str, api_version: &str) -> String {
     } else {
         format!("{base}/chat/completions")
     };
+
+    if shape != Shape::Azure {
+        // Only Azure versions its API in the query string. Appending it
+        // elsewhere is at best ignored and at worst a 404.
+        return path;
+    }
+
     let version = if api_version.trim().is_empty() {
         DEFAULT_API_VERSION
     } else {
         api_version.trim()
     };
     format!("{path}?api-version={version}")
+}
+
+/**
+ * Whether an endpoint may be plain HTTP.
+ *
+ * Only for a model on this machine. Ollama answers on `http://localhost:11434`
+ * and LM Studio on `http://localhost:1234`, and refusing those would refuse the
+ * whole point of running a model locally.
+ *
+ * Anywhere else it is a key and a sermon in clear across a church network,
+ * which is not a thing to allow because somebody typed it.
+ */
+pub fn transport_is_safe(endpoint: &str) -> bool {
+    let endpoint = endpoint.trim();
+    if endpoint.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = endpoint.strip_prefix("http://") else { return false };
+    let host = rest.split('/').next().unwrap_or_default();
+    let host = host.split(':').next().unwrap_or_default();
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
 }
 
 /// Whether a refusal was about `response_format` rather than about us.
@@ -423,13 +504,34 @@ fn send(
     body: &serde_json::Value,
 ) -> Result<String> {
 
+    if let Route::Own { deployment, .. } = route {
+        // Refused here rather than by declaring the deployment unusable, so the
+        // operator is told why instead of finding the assistant quietly off.
+        if !transport_is_safe(&deployment.endpoint) {
+            return Err(Failure::Unexpected(
+                "That address is not https. A model on this machine may use http://localhost; \
+                 anywhere else the key and the sermon would cross the network in clear."
+                    .into(),
+            ));
+        }
+    }
+
     let request = match route {
-        Route::Own { deployment, key } => client
-            .post(endpoint_url(&deployment.endpoint, &deployment.api_version))
-            .header("api-key", *key)
-            // Bearer as well as api-key: Foundry's model router accepts the
-            // former and some deployments only answer to one of the two.
-            .bearer_auth(*key),
+        Route::Own { deployment, key } => {
+            let url = endpoint_url(&deployment.endpoint, &deployment.api_version, deployment.shape);
+            match deployment.shape {
+                // Both headers on Azure: Foundry's model router accepts a
+                // bearer token and some deployments answer only to one of them.
+                Shape::Azure => client.post(url).header("api-key", *key).bearer_auth(*key),
+                Shape::OpenAi => client.post(url).bearer_auth(*key),
+                Shape::Anthropic => client
+                    .post(url)
+                    .header("x-api-key", *key)
+                    // Required, and the reason a first attempt returns 400
+                    // rather than an answer.
+                    .header("anthropic-version", ANTHROPIC_VERSION),
+            }
+        }
         Route::Hosted { base, device_token } => client
             .post(format!("{}/api/v1/assist", base.trim_end_matches('/')))
             .bearer_auth(*device_token),
@@ -437,7 +539,7 @@ fn send(
 
     let response = request
         .header("content-type", "application/json")
-        .json(body)
+        .json(&shaped(route, body))
         .send()
         .map_err(|error| Failure::Unreachable(because(&error)))?;
 
@@ -487,25 +589,207 @@ fn send(
     Ok(payload)
 }
 
+/// The version Anthropic requires in a header, and dates rather than numbers.
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/**
+ * The same request, addressed the way this service expects.
+ *
+ * Everything above builds one body: a model, a list of messages, and whatever
+ * else the caller wanted. Two of the three shapes take it as it is. Anthropic
+ * needs the system message lifted out into its own field and a `max_tokens`
+ * that it will not default for us — and being wrong about either is silent
+ * rather than loud, so it happens here where it can be read.
+ */
+fn shaped(route: &Route<'_>, body: &serde_json::Value) -> serde_json::Value {
+    let Route::Own { deployment, .. } = route else { return body.clone() };
+    if deployment.shape != Shape::Anthropic {
+        return body.clone();
+    }
+
+    let mut shaped = body.clone();
+    let Some(object) = shaped.as_object_mut() else { return shaped };
+
+    if let Some(messages) = object.get_mut("messages").and_then(|m| m.as_array_mut()) {
+        // Lifted out rather than dropped: left in the array it is ignored, and
+        // the prompt that tells the model what it is doing is the last thing to
+        // lose quietly.
+        let system: Vec<String> = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+            .filter_map(|m| m.get("content").and_then(|c| c.as_str()).map(String::from))
+            .collect();
+        messages.retain(|m| m.get("role").and_then(|r| r.as_str()) != Some("system"));
+        if !system.is_empty() {
+            object.insert("system".into(), system.join("\n\n").into());
+        }
+    }
+
+    // Required by Anthropic and optional everywhere else. Generous, because
+    // this cuts a summary off rather than refusing it.
+    object.entry("max_tokens").or_insert_with(|| ANTHROPIC_MAX_TOKENS.into());
+    // Not a parameter it knows; sent by the caller for the services that do.
+    object.remove("response_format");
+    shaped
+}
+
+/// Anthropic will not choose a length for us, so this does.
+const ANTHROPIC_MAX_TOKENS: u32 = 8192;
+
 /// Digs the message content out of a chat completion.
 fn content_of(payload: &str) -> Result<String> {
     let parsed: serde_json::Value = serde_json::from_str(payload).map_err(|error| {
         Failure::Unexpected(format!("the model response was not JSON: {error}"))
     })?;
 
-    Ok(parsed
+    // Two places to look, and no way to tell them apart from the payload alone
+    // beyond trying. Anthropic answers `content[0].text`; everybody else
+    // answers `choices[0].message.content`. Reading only the second turned a
+    // good Claude answer into a model with nothing to say.
+    let openai = parsed
         .get("choices")
         .and_then(|choices| choices.get(0))
         .and_then(|choice| choice.get("message"))
         .and_then(|message| message.get("content"))
-        .and_then(|content| content.as_str())
-        .unwrap_or_default()
-        .to_string())
+        .and_then(|content| content.as_str());
+
+    let anthropic = parsed
+        .get("content")
+        .and_then(|content| content.as_array())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(|t| t.as_str()) != Some("thinking"))
+                .filter_map(|block| block.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join("")
+        });
+
+    Ok(openai
+        .map(String::from)
+        .or(anthropic)
+        .unwrap_or_default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deployment(endpoint: &str, shape: Shape) -> Deployment {
+        Deployment {
+            endpoint: endpoint.into(),
+            model: "a-model".into(),
+            api_version: String::new(),
+            shape,
+        }
+    }
+
+    /// Only Azure versions its API in the query string. Appending it elsewhere
+    /// is ignored at best and a 404 at worst.
+    #[test]
+    fn only_azure_gets_an_api_version() {
+        assert_eq!(
+            endpoint_url("https://api.openai.com/v1", "", Shape::OpenAi),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            endpoint_url("http://localhost:11434/v1", "", Shape::OpenAi),
+            "http://localhost:11434/v1/chat/completions"
+        );
+        assert!(endpoint_url("https://x.openai.azure.com", "2024-05-01-preview", Shape::Azure)
+            .contains("?api-version="));
+    }
+
+    /// Anthropic's path is not a chat completion, and a church may type the
+    /// base with or without the version segment.
+    #[test]
+    fn anthropic_is_addressed_at_messages() {
+        for typed in ["https://api.anthropic.com", "https://api.anthropic.com/v1", "https://api.anthropic.com/v1/messages"] {
+            assert_eq!(
+                endpoint_url(typed, "", Shape::Anthropic),
+                "https://api.anthropic.com/v1/messages",
+                "{typed}"
+            );
+        }
+    }
+
+    /// The system prompt is lifted into its own field rather than left in the
+    /// array, where Anthropic ignores it -- and losing the prompt that says
+    /// what the model is doing is the quietest failure here.
+    #[test]
+    fn anthropic_takes_the_system_prompt_out_of_the_messages() {
+        let deployment = deployment("https://api.anthropic.com", Shape::Anthropic);
+        let route = Route::Own { deployment: &deployment, key: "k" };
+        let body = serde_json::json!({
+            "model": "claude",
+            "messages": [
+                {"role": "system", "content": "You summarise sermons."},
+                {"role": "user", "content": "the transcript"}
+            ],
+            "response_format": {"type": "json_object"}
+        });
+
+        let sent = shaped(&route, &body);
+        assert_eq!(sent["system"], "You summarise sermons.");
+        assert_eq!(sent["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(sent["messages"][0]["role"], "user");
+        // Required by Anthropic, and a 400 without it.
+        assert!(sent["max_tokens"].is_number());
+        // Not a parameter it knows.
+        assert!(sent.get("response_format").is_none());
+    }
+
+    /// Everybody else gets the body exactly as it was built.
+    #[test]
+    fn the_other_shapes_are_sent_unchanged() {
+        for shape in [Shape::OpenAi, Shape::Azure] {
+            let deployment = deployment("https://api.openai.com/v1", shape);
+            let route = Route::Own { deployment: &deployment, key: "k" };
+            let body = serde_json::json!({"messages": [{"role": "system", "content": "s"}]});
+            assert_eq!(shaped(&route, &body), body, "{shape:?}");
+        }
+    }
+
+    /// Both reply shapes read, because the wrong one turns a good answer into
+    /// a model with nothing to say.
+    #[test]
+    fn an_answer_is_read_from_either_shape() {
+        assert_eq!(
+            content_of(r#"{"choices":[{"message":{"content":"from openai"}}]}"#).unwrap(),
+            "from openai"
+        );
+        assert_eq!(
+            content_of(r#"{"content":[{"type":"text","text":"from claude"}]}"#).unwrap(),
+            "from claude"
+        );
+        // Thinking blocks are not the answer.
+        assert_eq!(
+            content_of(r#"{"content":[{"type":"thinking","text":"hmm"},{"type":"text","text":"the answer"}]}"#)
+                .unwrap(),
+            "the answer"
+        );
+    }
+
+    /// Plain HTTP reaches a model on this machine and nothing else. Anywhere
+    /// but loopback it is a key and a sermon in clear across a church network.
+    #[test]
+    fn plain_http_is_for_this_machine_only() {
+        for allowed in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:1234/v1",
+            "https://api.openai.com/v1",
+        ] {
+            assert!(transport_is_safe(allowed), "{allowed}");
+        }
+        for refused in [
+            "http://192.168.1.50:11434/v1",
+            "http://models.example.com/v1",
+            "http://localhost.evil.com/v1",
+            "ftp://localhost/v1",
+        ] {
+            assert!(!transport_is_safe(refused), "{refused}");
+        }
+    }
 
     #[test]
     fn reads_a_wait_the_service_asked_for() {
@@ -648,34 +932,34 @@ mod tests {
         // What the portal shows and an operator pastes. Without the segment it
         // is a 404 that looks exactly like a typo.
         assert_eq!(
-            endpoint_url("https://church-gpt.services.ai.azure.com", "2024-05-01-preview"),
+            endpoint_url("https://church-gpt.services.ai.azure.com", "2024-05-01-preview", Shape::Azure),
             "https://church-gpt.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview"
         );
         // Trailing slash, same answer.
         assert_eq!(
-            endpoint_url("https://church-gpt.services.ai.azure.com/", "v1"),
+            endpoint_url("https://church-gpt.services.ai.azure.com/", "v1", Shape::Azure),
             "https://church-gpt.services.ai.azure.com/models/chat/completions?api-version=v1"
         );
     }
 
     #[test]
     fn a_route_the_operator_already_named_is_left_alone() {
-        assert!(endpoint_url("https://x.services.ai.azure.com/models", "v1")
+        assert!(endpoint_url("https://x.services.ai.azure.com/models", "v1", Shape::Azure)
             .starts_with("https://x.services.ai.azure.com/models/chat/completions"));
         // Azure OpenAI is a different shape and must not be rewritten.
-        let openai = endpoint_url("https://x.openai.azure.com/openai/deployments/gpt/", "v1");
+        let openai = endpoint_url("https://x.openai.azure.com/openai/deployments/gpt/", "v1", Shape::Azure);
         assert!(!openai.contains("/models"), "{openai}");
     }
 
     #[test]
     fn a_host_that_is_not_foundry_is_never_rewritten() {
-        let other = endpoint_url("https://api.example.test/v1", "2024-05-01-preview");
+        let other = endpoint_url("https://api.example.test/v1", "2024-05-01-preview", Shape::Azure);
         assert_eq!(other, "https://api.example.test/v1/chat/completions?api-version=2024-05-01-preview");
     }
 
     #[test]
     fn an_empty_version_falls_back_rather_than_sending_nothing() {
-        assert!(endpoint_url("https://api.example.test", "   ")
+        assert!(endpoint_url("https://api.example.test", "   ", Shape::Azure)
             .ends_with(&format!("api-version={DEFAULT_API_VERSION}")));
     }
 
@@ -700,6 +984,7 @@ mod tests {
             endpoint: "https://x.services.ai.azure.com".into(),
             model: "gpt-4o-mini".into(),
             api_version: String::new(),
+                    shape: Shape::Azure,
         };
         assert!(Route::Own { deployment: &full, key: "k" }.usable());
         // A deployment without a key is a deployment nobody can call.
