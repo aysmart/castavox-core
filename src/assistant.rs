@@ -398,6 +398,90 @@ pub fn chunks(text: &str, size: usize, overlap: usize) -> Vec<String> {
     out
 }
 
+/// What Test can answer without sending anything.
+///
+/// Separate because these two are refusals rather than results: there is
+/// nothing to ask, or asking would itself be the mistake. The second matters
+/// most -- an http address off this machine puts the key on the wire, and
+/// finding that out from the reply would be finding it out too late.
+fn preflight(route: &Route<'_>) -> std::result::Result<(), String> {
+    if !route.usable() {
+        return Err("Fill in the address, the model name and the key first.".into());
+    }
+    if let Route::Own { deployment, .. } = route {
+        if !transport_is_safe(&deployment.endpoint) {
+            return Err("That address is plain http and is not on this machine, so the key and \
+                        what was said would cross the network in clear. Use https, or a model \
+                        running here."
+                .into());
+        }
+    }
+    Ok(())
+}
+
+/// Whether the configured model actually answers, said in one sentence.
+///
+/// There was no way to learn this except to start a service and watch nothing
+/// happen, which is the worst possible moment and gives no reason. This asks
+/// the model the smallest question there is and reports which step failed:
+/// reached, authorised, model found, answered.
+///
+/// The sentences are specific on purpose, unlike the ones during a service. An
+/// operator pressing Test is asking what is wrong with their own endpoint and
+/// their own key, and "something went wrong" would waste the trip. A key is
+/// never quoted back, only whether it was accepted.
+pub fn check(client: &reqwest::blocking::Client, route: &Route<'_>) -> std::result::Result<String, String> {
+    preflight(route)?;
+
+    // One token, no JSON shape asked for. The cheapest thing that still proves
+    // every step: the address resolved, the key was accepted, the model name
+    // exists, and something came back out.
+    let body = serde_json::json!({
+        "messages": [{ "role": "user", "content": "Reply with the single word: ready" }],
+        "max_tokens": 16,
+        "temperature": 0.0,
+    });
+
+    match complete(client, route, body, false) {
+        Ok(said) if said.trim().is_empty() => {
+            Err("The model was reached and answered with nothing. That is usually a model name \
+                 that exists but is not a chat model."
+                .into())
+        }
+        Ok(_) => Ok("Reached, key accepted, model answered.".into()),
+        Err(Failure::Unreachable(detail)) => Err(format!(
+            "Could not reach that address. {}",
+            if is_intercepted(&detail) {
+                "Something on this network is intercepting the connection -- a proxy or filter \
+                 the church may have to allow this through."
+            } else {
+                "Check the address, and that the machine or service is running."
+            }
+        )),
+        Err(Failure::Refused { status, payload }) => Err(match status.as_u16() {
+            401 | 403 => "The key was refused. Check it is the key for this service, and that it \
+                          has not expired."
+                .to_string(),
+            // 404 on an address that resolved is nearly always the model name:
+            // most services answer an unknown model that way rather than 400.
+            404 => "Reached, but nothing was there. Check the model name, and that the address \
+                    is the one the service documents."
+                .to_string(),
+            429 => "The key works, but the service is rate-limiting or out of quota.".to_string(),
+            _ if is_filtered_refusal(&payload) => {
+                "Reached and authorised, but the service's content filter refused even this. \
+                 That is the service's setting, not ours."
+                    .to_string()
+            }
+            other => format!("The service answered {other} and refused the request."),
+        }),
+        Err(Failure::Unexpected(detail)) => Err(format!(
+            "Something answered, but not like a chat model: {}",
+            detail.chars().take(160).collect::<String>()
+        )),
+    }
+}
+
 /// Sends a chat completion and returns the message content.
 ///
 /// `body` is the request as the caller wants it — model, messages, whatever
@@ -673,6 +757,35 @@ fn content_of(payload: &str) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The two answers Test can give without sending anything, which are the
+    /// two an operator hits most: nothing filled in, and an address that would
+    /// put their key on the wire in clear.
+    #[test]
+    fn check_refuses_before_it_sends() {
+        let empty = Deployment {
+            endpoint: String::new(),
+            model: String::new(),
+            api_version: String::new(),
+            shape: Shape::OpenAi,
+        };
+        let said = preflight(&Route::Own { deployment: &empty, key: "" })
+            .expect_err("nothing to test");
+        assert!(said.contains("Fill in"), "{said}");
+
+        // http off this machine. Refused before a request rather than after,
+        // because by then the key has already been sent.
+        let plain = Deployment {
+            endpoint: "http://models.example.org/v1".into(),
+            model: "a-model".into(),
+            api_version: String::new(),
+            shape: Shape::OpenAi,
+        };
+        let said = preflight(&Route::Own { deployment: &plain, key: "sk-whatever" })
+            .expect_err("plain http off-machine");
+        assert!(said.contains("https"), "{said}");
+        assert!(!said.contains("sk-whatever"), "a key must never be quoted back: {said}");
+    }
+
     use super::*;
 
     fn deployment(endpoint: &str, shape: Shape) -> Deployment {
