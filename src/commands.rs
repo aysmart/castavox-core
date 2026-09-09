@@ -649,6 +649,19 @@ mod tests {
         }
     }
 
+    /// Without the wake word, which is how most operators will say it.
+    #[test]
+    fn a_slide_moves_without_naming_the_machine() {
+        let mut ears = listener();
+        for (said, expected) in [
+            ("next slide", Command::Slide { to: None, by: 1 }),
+            ("previous slide", Command::Slide { to: None, by: -1 }),
+            ("slide four", Command::Slide { to: Some(4), by: 0 }),
+        ] {
+            assert_eq!(ears.hear(said, true), Some(expected), "{said}");
+        }
+    }
+
     /// Standing alone, the whole utterance has to be the instruction --
     /// otherwise it is speech about slides rather than an instruction to move
     /// one.
