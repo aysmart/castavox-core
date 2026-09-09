@@ -78,6 +78,21 @@ pub enum Command {
     Clear,
     /// Read from another translation, named however it was said.
     Switch { translation: String },
+    /// Move within the deck that is already staged.
+    ///
+    /// # Why this is not `NextVerse` with a different name
+    ///
+    /// A verse and a slide are moved through by the same gesture and mean
+    /// different things: the verses are a passage the application resolved,
+    /// and the slides are whatever an operator put in an order. Sharing a
+    /// command would make "next" ambiguous the moment both are staged, and the
+    /// wrong one moving in front of a congregation is not recoverable by
+    /// saying it again.
+    ///
+    /// `to` is an absolute slide when one was named -- "slide four" -- counted
+    /// from one as a person counts. `by` is a step: 1 for next, -1 for
+    /// previous, and 0 when `to` says where to go.
+    Slide { to: Option<i64>, by: i64 },
 
     /*
      * Moving about the book being read.
@@ -136,11 +151,37 @@ const BUILT_IN: &[(&str, Command)] = &[
     ("go back", Command::PreviousVerse),
     ("next verse", Command::NextVerse),
     ("next one", Command::NextVerse),
+    // Longest first, as above: "previous slide" contains "slide".
+    ("previous slide", Command::Slide { to: None, by: -1 }),
+    ("slide back", Command::Slide { to: None, by: -1 }),
+    ("last slide", Command::Slide { to: None, by: -1 }),
+    ("next slide", Command::Slide { to: None, by: 1 }),
     ("clear the screen", Command::Clear),
     ("clear the display", Command::Clear),
     ("blank the screen", Command::Clear),
     ("clear screen", Command::Clear),
 ];
+
+/// "Slide four", when that is what was said.
+///
+/// A spoken number can be several words -- "twenty one" -- so it is read by
+/// the same code that reads a chapter rather than parsed as a digit.
+///
+/// `whole` is the difference between the two ways in. Standing alone, the
+/// utterance has to be *only* the instruction: "slide four is the one I mean"
+/// is a person talking about a slide, and moving the screen would be wrong.
+/// After the wake word nobody says it by accident, so trailing words are
+/// allowed -- "castavox slide four please" is somebody asking.
+fn numbered_slide(spoken: &[String], whole: bool) -> Option<(Command, String)> {
+    if spoken.len() < 2 || spoken[0] != "slide" {
+        return None;
+    }
+    let (number, used) = crate::numbers::read_first(&spoken[1..])?;
+    if number < 1 || (whole && used + 1 != spoken.len()) {
+        return None;
+    }
+    Some((Command::Slide { to: Some(number), by: 0 }, format!("slide {number}")))
+}
 
 /// Everything needed to read the stream for commands.
 #[derive(Debug, Clone)]
@@ -423,6 +464,10 @@ impl Listener {
         // words left over, and so does every sentence that merely mentions a
         // reference.
         let spoken: Vec<String> = said.split(' ').map(str::to_string).collect();
+        if let Some(found) = numbered_slide(&spoken, true) {
+            return Some(found);
+        }
+
         if let Some((command, key, consumed)) = self.match_passage(&spoken) {
             if consumed == spoken.len() {
                 return Some((command, key));
@@ -555,6 +600,11 @@ impl Listener {
         }
 
         let spoken: Vec<String> = said.split(' ').map(str::to_string).collect();
+        // After the wake word, so the whole utterance need not be the
+        // instruction: "castavox slide four please" is still somebody asking.
+        if let Some(found) = numbered_slide(&spoken, false) {
+            return Some(found);
+        }
         if let Some((command, key, _)) = self.match_passage(&spoken) {
             return Some((command, key));
         }
@@ -577,6 +627,69 @@ impl Listener {
 
 #[cfg(test)]
 mod tests {
+    /// A deck is moved through by voice, and only when that is all that was
+    /// said.
+    #[test]
+    fn slides_move_on_the_word_and_not_in_a_sentence() {
+        let mut ears = listener();
+
+        for (said, expected) in [
+            ("castavox next slide", Command::Slide { to: None, by: 1 }),
+            ("castavox previous slide", Command::Slide { to: None, by: -1 }),
+            ("castavox slide back", Command::Slide { to: None, by: -1 }),
+            // Several words for one number, read rather than parsed.
+            ("castavox slide four", Command::Slide { to: Some(4), by: 0 }),
+            ("castavox slide twenty one", Command::Slide { to: Some(21), by: 0 }),
+        ] {
+            assert_eq!(ears.hear(said, true), Some(expected.clone()), "{said}");
+            // And again, because a finished instruction is forgotten on
+            // purpose: "next slide" twice is the most ordinary thing an
+            // operator will say, and it must move twice.
+            assert_eq!(ears.hear(said, true), Some(expected.clone()), "{said} again");
+        }
+    }
+
+    /// Standing alone, the whole utterance has to be the instruction --
+    /// otherwise it is speech about slides rather than an instruction to move
+    /// one.
+    #[test]
+    fn talking_about_a_slide_moves_nothing() {
+        let mut ears = listener();
+        for said in [
+            "slide four is the one I mean",
+            "the next slide shows what happened",
+            "on slide four you can see it",
+        ] {
+            assert_eq!(ears.hear(said, true), None, "{said}");
+        }
+
+        // After the wake word the rule is deliberately looser, and the same as
+        // every other instruction: nobody says the machine's name by accident,
+        // so what follows it is meant. "castavox next verse please" has always
+        // worked, and a slide must not be the one thing that does not.
+        assert_eq!(
+            ears.hear("castavox slide four please", true),
+            Some(Command::Slide { to: Some(4), by: 0 })
+        );
+
+        // Still not an instruction: the wake word does not make every sentence
+        // containing "slide" into one, because the word is not where an
+        // instruction starts.
+        assert_eq!(ears.hear("castavox put up slide four", true), None);
+    }
+
+    /// A slide is not a verse, and must not become one.
+    #[test]
+    fn a_slide_and_a_verse_are_different_instructions() {
+        let mut ears = listener();
+        assert_eq!(ears.hear("castavox next verse", true), Some(Command::NextVerse));
+        let _ = ears.hear("castavox clear the screen", true);
+        assert_eq!(
+            ears.hear("castavox next slide", true),
+            Some(Command::Slide { to: None, by: 1 })
+        );
+    }
+
     use super::*;
 
     fn translations() -> Vec<(String, String)> {
