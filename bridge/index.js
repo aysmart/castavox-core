@@ -483,6 +483,19 @@ function buildDeepgram() {
     endpointing: "800",
     // Return a result as soon as it is ready rather than waiting to batch it.
     no_delay: "true",
+    /*
+     * Out of Deepgram's model improvement programme, on every request.
+     *
+     * Its default is in: the audio of a request that does not say otherwise
+     * may be kept and used to train Deepgram's models. What we send is a
+     * church's service -- sermon, prayers, notices, whatever the room says --
+     * and our privacy policy tells them it is transcribed and gone. Opted
+     * out, Deepgram keeps a request's data only while it processes it.
+     *
+     * Per request because that is the only way Deepgram offers it; there is
+     * no account setting to rely on instead.
+     */
+    mip_opt_out: "true",
   });
 
   const socket = new WebSocket(`wss://api.deepgram.com/v1/listen?${query}`, {

@@ -439,6 +439,10 @@ describe("a hosted session", () => {
     match(run.stderr(), /AUTH:Bearer granted-token/);
     // And the model came from the broker, so changing it needs no release.
     match(run.stderr(), /WS:wss:\/\/api\.deepgram\.com\/v1\/listen\?.*model=nova-3/);
+    // Out of Deepgram's model training. The privacy policy promises a
+    // church's audio is transcribed and gone; left to Deepgram's default, it
+    // could be kept and trained on.
+    match(run.stderr(), /WS:wss:\/\/api\.deepgram\.com\/v1\/listen\?.*mip_opt_out=true/);
     // No region: Deepgram has one host, and a session that demanded one would
     // refuse to start against a broker that rightly did not send it.
     ok(!run.stderr().includes("BUILT:"), "should not have built an Azure recogniser");
