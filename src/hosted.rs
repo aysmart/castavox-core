@@ -226,6 +226,19 @@ pub struct Broker {
     base: String,
 }
 
+/// A way into the subscription page, for a machine that is already activated.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Portal {
+    /// Opened in the church's browser. Carries a signed pass naming the
+    /// subscription, never the licence key.
+    pub url: String,
+    /// Where the code went, partly hidden -- enough to know which mailbox to
+    /// open, not enough to be worth anything to somebody else.
+    #[serde(default)]
+    pub sent_to: String,
+}
+
 impl Broker {
     /// Points at the live broker, or wherever `CASTAVOX_BROKER_URL` says.
     ///
@@ -295,6 +308,34 @@ impl Broker {
         let response = self
             .client()?
             .get(format!("{}/api/v1/entitlement", self.base))
+            .bearer_auth(device_token)
+            .send()
+            .map_err(|error| Error::Unreachable(error.to_string()))?;
+
+        read(response)
+    }
+
+    /// Asks for a sign-in code and a link to the subscription page.
+    ///
+    /// # Why an application can ask at all
+    ///
+    /// For the one case a church cannot get out of on their own: the
+    /// subscription has ended, the application refuses to start listening, and
+    /// the page wants a licence key that is on a machine in the office or an
+    /// invoice from eight months ago.
+    ///
+    /// The device token is the authority, and it is the right one -- it proves
+    /// this machine is activated on that subscription, which is exactly what
+    /// "send my church a sign-in code" needs. It is not authority to *see* the
+    /// subscription: the code goes to the email on the account and still has
+    /// to be typed into a browser. What this saves is the typing.
+    ///
+    /// The licence key does not travel and could not: it was exchanged for
+    /// this token at activation and discarded, which is right and stays true.
+    pub fn portal(&self, device_token: &str) -> Result<Portal> {
+        let response = self
+            .client()?
+            .post(format!("{}/api/v1/portal", self.base))
             .bearer_auth(device_token)
             .send()
             .map_err(|error| Error::Unreachable(error.to_string()))?;
