@@ -415,17 +415,21 @@ describe("a hosted session", () => {
   });
 
   it("runs on Deepgram when the broker says so, and meters it the same way", async () => {
+    let said = [];
     const { server, calls } = broker({
-      "session/start": () => ({
-        status: 200,
-        body: {
-          sessionId: "sess-dg",
-          provider: "deepgram",
-          token: "granted-token",
-          model: "nova-3",
-          heartbeatSeconds: 1,
-        },
-      }),
+      "session/start": (payload) => {
+        said = payload.speaks || [];
+        return {
+          status: 200,
+          body: {
+            sessionId: "sess-dg",
+            provider: "deepgram",
+            token: "granted-token",
+            model: "nova-3",
+            heartbeatSeconds: 1,
+          },
+        };
+      },
       "session/heartbeat": () => ({ status: 200, body: { token: "granted-again", heartbeatSeconds: 1 } }),
       "session/end": () => ({ status: 200, body: { ended: true } }),
     });
@@ -441,8 +445,10 @@ describe("a hosted session", () => {
     match(run.stderr(), /WS:wss:\/\/api\.deepgram\.com\/v1\/listen\?.*model=nova-3/);
     // Out of Deepgram's model training. The privacy policy promises a
     // church's audio is transcribed and gone; left to Deepgram's default, it
-    // could be kept and trained on.
+    // could be kept and trained on. And the broker is told so, because it
+    // gives Deepgram only to a copy that says it opts out.
     match(run.stderr(), /WS:wss:\/\/api\.deepgram\.com\/v1\/listen\?.*mip_opt_out=true/);
+    ok(said.includes("deepgram-no-training"), `the bridge said ${JSON.stringify(said)}`);
     // No region: Deepgram has one host, and a session that demanded one would
     // refuse to start against a broker that rightly did not send it.
     ok(!run.stderr().includes("BUILT:"), "should not have built an Azure recogniser");

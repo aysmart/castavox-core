@@ -160,6 +160,17 @@ let hostedRegion = "";
  * key is Azure and never asks.
  */
 let providerName = "azure";
+/**
+ * What this copy can talk to, told to the broker so it chooses a service we can use.
+ *
+ * `deepgram-no-training` says this copy opts every Deepgram request out of its
+ * model training (see `buildDeepgram`). The broker gives Deepgram only to a
+ * bridge that says so; one that says plain `deepgram` is from before the
+ * opt-out and is given Azure, so a church that has not updated is not the one
+ * whose audio is kept.
+ */
+const SPEAKS = ["azure", "deepgram", "deepgram-no-training"];
+
 /** Deepgram's model, named by the broker so it can change without a release. */
 let deepgramModel = "nova-3";
 let heartbeatTimer = null;
@@ -291,7 +302,7 @@ async function openSession() {
   // on Azure and a new one moves, without anybody choosing which churches find
   // out on a Sunday.
   const { reached, ok, detail, why, message } = await broker("session/start", {
-    speaks: ["azure", "deepgram"],
+    speaks: SPEAKS,
   });
   if (!reached) {
     fail(reachError(why, message), true);
@@ -349,7 +360,7 @@ async function heartbeat() {
     // Repeated, for the same reason it is sent at the start: the renewed token
     // is what the next reconnection uses, and it has to be for a service this
     // copy can talk to.
-    speaks: ["azure", "deepgram"],
+    speaks: SPEAKS,
   });
 
   if (ok) {
