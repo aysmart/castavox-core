@@ -138,6 +138,23 @@ pub struct Usage {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Entitlement {
+    /// The address on the account, so an operator can tell at a glance which
+    /// subscription this machine is on.
+    ///
+    /// A church with two -- one they are leaving and one they have just bought
+    /// -- had no way to tell them apart from the desk, which is how a machine
+    /// holding the wrong one went unnoticed. It is also where a sign-in code
+    /// goes, so showing it means never guessing which mailbox to open.
+    ///
+    /// Defaulted, because a broker that predates this sends no such field and
+    /// an application that refused to read the answer would be worse than one
+    /// that shows no address.
+    #[serde(default)]
+    pub email: String,
+    /// What the church is called on the account. A church running two campuses
+    /// recognises "St Luke's" faster than an address they set up once.
+    #[serde(default)]
+    pub account_name: String,
     pub status: String,
     pub expires_at: Option<i64>,
     pub period_ends_at: i64,
