@@ -655,11 +655,66 @@ function buildDeepgram() {
     scheduleRestart(`the speech service closed the connection (${code})`);
   });
 
+  /*
+   * How far behind the uplink may fall before audio is dropped instead.
+   *
+   * # The fault this exists for
+   *
+   * `socket.send` never refuses. When the connection cannot carry 32 kB a
+   * second -- hall wifi with a hundred phones on it, a VPN, a hotspot -- the
+   * bytes queue inside the socket instead, and *audio is realtime*: there is
+   * no idle moment later to work a backlog off in, because the next second of
+   * speech is always arriving. So a three-second stall does not cost three
+   * seconds. It costs three seconds on every utterance for the rest of the
+   * service, and the transcript slides quietly further behind the preacher
+   * with nothing on screen to say why.
+   *
+   * Reported as "it lags from time to time", which is exactly what a step that
+   * never recovers looks like from the desk.
+   *
+   * # Why dropping is the better loss
+   *
+   * Something has to give: the connection cannot carry what the microphone
+   * produces. Dropping a second of audio costs a few words, once, and the
+   * transcript stays level with the room. Queueing it costs every word after
+   * it, indefinitely. A verse detected late is worse than a verse missed --
+   * the operator has moved on, and the wrong thing goes up.
+   *
+   * One second, because Deepgram's own endpointing works in that order and a
+   * shorter threshold would fire on ordinary jitter.
+   */
+  const BACKLOG_LIMIT = BYTES_PER_SECOND;
+  let skippedBytes = 0;
+  let skippingSince = 0;
+
   return {
     kind: "deepgram",
     socket,
     write(chunk) {
       if (socket.readyState === WebSocket.OPEN) {
+        if (socket.bufferedAmount > BACKLOG_LIMIT) {
+          if (!skippingSince) skippingSince = Date.now();
+          skippedBytes += chunk.byteLength;
+          return false;
+        }
+        if (skippingSince) {
+          /*
+           * Said once, when it ends, on stderr.
+           *
+           * The host logs this line, so a church that reports lagging has the
+           * answer in the file rather than a guess: how far behind the
+           * connection got, and how much speech went with it. Per-chunk it
+           * would be a hundred lines a second and would itself become the
+           * problem it is describing.
+           */
+          const behind = ((Date.now() - skippingSince) / 1000).toFixed(1);
+          const lost = Math.round((skippedBytes / BYTES_PER_SECOND) * 1000);
+          console.error(
+            `[deepgram] the connection could not keep up for ${behind}s; ${lost}ms of audio was skipped rather than queued`,
+          );
+          skippingSince = 0;
+          skippedBytes = 0;
+        }
         socket.send(chunk);
         lastAudioAt = Date.now();
         return true;

@@ -87,6 +87,8 @@ class Socket extends EventEmitter {
     say("WS:" + url);
     say("AUTH:" + ((options && options.headers && options.headers.authorization) || ""));
     this.readyState = 0;
+    /** What a real socket reports when the uplink cannot keep up. */
+    this.bufferedAmount = Number(process.env.FAKE_BACKLOG || 0);
     setTimeout(() => {
       this.readyState = 1;
       this.emit("open");
@@ -483,6 +485,58 @@ describe("a hosted session", () => {
     // closing seconds of a sermon are simply dropped.
     match(run.stderr(), /SENT:{"type":"CloseStream"}/);
     ok(calls.some((c) => c.path === "session/end"), "should have closed the session");
+  });
+
+  /**
+   * A connection that cannot carry the microphone costs a few words, once —
+   * not every word after it.
+   *
+   * `send` never refuses, and audio is realtime: there is no idle moment later
+   * to work a backlog off in. So a stall that queues becomes a transcript that
+   * runs permanently behind the preacher, which is what "it lags from time to
+   * time" is. The audio is dropped instead, the metering never counts it, and
+   * the reason is on stderr for the church that reports it.
+   */
+  it("skips audio rather than queueing it when the uplink is behind", async () => {
+    const { server, calls } = broker({
+      "session/start": () => ({
+        status: 200,
+        body: {
+          sessionId: "sess-slow",
+          provider: "deepgram",
+          token: "granted-token",
+          model: "nova-3",
+          heartbeatSeconds: 1,
+        },
+      }),
+      "session/heartbeat": () => ({ status: 200, body: { token: "again", heartbeatSeconds: 1 } }),
+      "session/end": () => ({ status: 200, body: { ended: true } }),
+    });
+    servers.push(server);
+    const url = await listen(server);
+    // A socket already holding more than a second of audio, which is what a
+    // congested uplink looks like from here.
+    const run = start(stage(), url, { FAKE_BACKLOG: String(BYTES_PER_SECOND * 3) });
+
+    await until(() => run.stderr().includes("WS:"), "the socket");
+    run.child.stdin.write(Buffer.alloc(BYTES_PER_SECOND * 2));
+
+    await until(
+      () => calls.some((c) => c.path === "session/heartbeat"),
+      "the heartbeat",
+    );
+
+    // Nothing reached Deepgram, so nothing is billed to the church: the
+    // metering counts what was sent rather than what was captured.
+    ok(!run.stderr().includes("AUDIO:"), "should not have sent the audio");
+    strictEqual(
+      calls.find((c) => c.path === "session/heartbeat").payload.seconds,
+      0,
+      "skipped audio must not be billed",
+    );
+
+    run.child.stdin.end();
+    await run.exited;
   });
 
   it("never sends Deepgram a locale it refuses", async () => {
