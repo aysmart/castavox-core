@@ -119,7 +119,15 @@ const BROKER = (process.env.CASTAVOX_BROKER_URL || "").replace(/\/+$/, "");
 const DEVICE_TOKEN = process.env.CASTAVOX_DEVICE_TOKEN || "";
 const HOSTED = Boolean(BROKER && DEVICE_TOKEN);
 
-const RESTART_DELAY_MS = 1200;
+/**
+ * How long to wait before rebuilding a connection, by attempt.
+ *
+ * The first is nearly immediate: one dropped socket is the common case, and a
+ * second and a half of waiting is a second and a half of a sermon nobody
+ * hears. A service that is genuinely refusing is a different thing, so each
+ * further attempt waits longer rather than hammering it.
+ */
+const RESTART_WAITS_MS = [250, 1200, 3000, 6000];
 const REQUEST_TIMEOUT_MS = 15000;
 /** Long enough for a heartbeat to be attempted, short enough not to hang a quit. */
 const SHUTDOWN_GRACE_MS = HOSTED ? 4000 : 1500;
@@ -174,6 +182,10 @@ const SPEAKS = ["azure", "deepgram", "deepgram-no-training"];
 /** Deepgram's model, named by the broker so it can change without a release. */
 let deepgramModel = "nova-3";
 let heartbeatTimer = null;
+/** Whether the last heartbeat could not reach the broker, so recovery can say so. */
+let brokerUnreachable = false;
+/** Consecutive rebuilds, so a first blip is answered faster than a fifth. */
+let restartAttempts = 0;
 /** Streamed and already billed, so a heartbeat reports the difference. */
 let streamedBytes = 0;
 let reportedSeconds = 0;
@@ -405,7 +417,23 @@ async function heartbeat() {
   } else if (!reached) {
     // Offline mid-service. Keep listening on the token in hand and say so, so
     // the operator knows why the counter has stopped moving.
-    emit({ type: "reconnecting", message: "cannot reach the subscription; still listening" });
+    if (!brokerUnreachable) {
+      brokerUnreachable = true;
+      emit({ type: "reconnecting", message: "cannot reach the subscription; still listening" });
+    }
+  } else if (brokerUnreachable) {
+    /*
+     * Back, and the desk has to be told.
+     *
+     * The only thing that ever said "listening" again was a socket opening,
+     * and a heartbeat failing does not close the socket -- the audio never
+     * stopped. So one unreachable heartbeat left the desk reading
+     * "Reconnecting" for the rest of the service while every word was being
+     * transcribed perfectly, which is exactly what "it says reconnecting when
+     * the network is fine" is.
+     */
+    brokerUnreachable = false;
+    emit({ type: "listening" });
   }
 
   scheduleHeartbeat();
@@ -534,9 +562,20 @@ function buildDeepgram() {
    */
   const pending = [];
   let pendingBytes = 0;
-  const PENDING_LIMIT = BYTES_PER_SECOND * 5;
+  /*
+   * Two seconds, and the *newest* two.
+   *
+   * It was five, kept from the front, which guaranteed that a reconnection
+   * resumed five seconds behind the room and stayed there: the backlog is
+   * dumped into the socket the moment it opens, and audio is realtime, so
+   * nothing ever catches up. Keeping the newest is the same trade the backlog
+   * rule below makes -- lose a couple of seconds of words once, rather than
+   * every word after them late.
+   */
+  const PENDING_LIMIT = BYTES_PER_SECOND * 2;
 
   socket.on("open", () => {
+    restartAttempts = 0;
     emit({ type: "listening" });
     for (const chunk of pending.splice(0)) socket.send(chunk);
     pendingBytes = 0;
@@ -720,9 +759,14 @@ function buildDeepgram() {
         return true;
       }
       // Held until the handshake finishes. Counted as sent, because it will be.
-      if (socket.readyState === WebSocket.CONNECTING && pendingBytes + chunk.byteLength <= PENDING_LIMIT) {
+      if (socket.readyState === WebSocket.CONNECTING) {
         pending.push(Buffer.from(chunk));
         pendingBytes += chunk.byteLength;
+        // The oldest goes first: what matters on resume is being level with
+        // the room, not owning the first syllable of the gap.
+        while (pendingBytes > PENDING_LIMIT && pending.length > 1) {
+          pendingBytes -= pending.shift().byteLength;
+        }
         return true;
       }
       return false;
@@ -914,10 +958,14 @@ function scheduleRestart(reason) {
   pushStream = null;
   if (dying) dying.close();
 
+  const wait =
+    RESTART_WAITS_MS[Math.min(restartAttempts, RESTART_WAITS_MS.length - 1)];
+  restartAttempts += 1;
+
   restartTimer = setTimeout(() => {
     restartTimer = null;
     if (!shuttingDown) startRecognition();
-  }, RESTART_DELAY_MS);
+  }, wait);
 }
 
 /**
